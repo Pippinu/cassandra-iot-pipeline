@@ -1,0 +1,112 @@
+version: '3.8'
+
+services:
+  # Zookeeper (required by Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - iot-network
+    mem_limit: 512m
+
+  # Kafka broker
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_HEAD_OPTS: "-Xmx512G -Xms256M" # Control JVM heap
+    networks:
+      - iot-network
+    mem_limit: 1g
+
+  # Cassandra Node 1 (seed node)
+  cassandra-1:
+    image: cassandra:4.1
+    container_name: cassandra-1
+    ports:
+      - "9042:9042"  # CQL port
+    environment:
+      CASSANDRA_CLUSTER_NAME: IoT-Cluster
+      CASSANDRA_DC: dc1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_SEEDS: cassandra-1
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 200M
+    mem_limit: 1200m
+    volumes:
+      - cassandra-data-1:/var/lib/cassandra
+    networks:
+      - iot-network
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Cassandra Node 2
+  cassandra-2:
+    image: cassandra:4.1
+    container_name: cassandra-2
+    environment:
+      CASSANDRA_CLUSTER_NAME: IoT-Cluster
+      CASSANDRA_DC: dc1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_SEEDS: cassandra-1
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 200M
+    mem_limit: 1200m
+    volumes:
+      - cassandra-data-2:/var/lib/cassandra
+    networks:
+      - iot-network
+    depends_on:
+      cassandra-1:
+        condition: service_healthy
+
+  # Cassandra Node 3
+  cassandra-3:
+    image: cassandra:4.1
+    container_name: cassandra-3
+    environment:
+      CASSANDRA_CLUSTER_NAME: IoT-Cluster
+      CASSANDRA_DC: dc1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_SEEDS: cassandra-1
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 200M
+    mem_limit: 1200m
+    volumes:
+      - cassandra-data-3:/var/lib/cassandra
+    networks:
+      - iot-network
+    depends_on:
+      cassandra-1:
+        condition: service_healthy
+
+volumes:
+  cassandra-data-1:
+  cassandra-data-2:
+  cassandra-data-3:
+
+networks:
+  iot-network:
+    driver: bridge
