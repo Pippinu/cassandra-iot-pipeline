@@ -304,4 +304,4 @@ These scripts are designed for a **15-minute live presentation** to visually sho
 
 ## License
 
-MIT License – feel free to use this project as a reference for learning Cassandra, Kafka, or Spark Streaming, or as a starting point for your own experiments. 
+MIT License – feel free to use this project as a reference for learning Cassandra, Kafka, or Spark Streaming, or as a starting point for your own experiments.
