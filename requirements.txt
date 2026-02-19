@@ -13,6 +13,7 @@ chardet==5.2.0
 click==8.1.6
 colorama==0.4.6
 command-not-found==0.3
+confluent-kafka==2.3.0
 contourpy==1.0.7
 cryptography==41.0.7
 cssselect==1.2.0
@@ -28,6 +29,7 @@ docker-compose==1.29.2
 dockerpty==0.4.1
 docopt==0.6.2
 et-xmlfile==1.0.1
+fastavro==1.9.4
 fonttools==4.46.0
 fs==2.4.16
 fuse-python==1.0.7
