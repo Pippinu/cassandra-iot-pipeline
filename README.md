@@ -7,8 +7,7 @@ systems concepts including tunable consistency, schema enforcement, and
 compaction strategies.
 
 > Built as a learning project. Every architectural decision is documented
-> in [`/docs`](./docs).
-
+> in [`/docs`](./iot-cassandra-pipeline/docs).
 ---
 
 ## Architecture
