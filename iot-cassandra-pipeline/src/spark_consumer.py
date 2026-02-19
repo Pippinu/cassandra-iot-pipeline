@@ -1,38 +1,65 @@
 #!/usr/bin/env python3
 """
-Spark Streaming Consumer: Kafka → Cassandra Pipeline
+Spark Streaming Consumer: Kafka → Cassandra Pipeline (Avro + Schema Registry)
 
-Reads IoT sensor events from Kafka and writes to Cassandra with dual strategy:
+Reads IoT sensor events from Kafka (Avro-encoded) and writes to Cassandra:
 1. Raw events      → sensor_events table      (CL=ONE,    write-optimized)
 2. Hourly aggregates → hourly_aggregates table (CL=QUORUM, read-optimized)
 """
 
+import sys
+import requests
+
 from pyspark.sql import SparkSession
+from pyspark.sql.avro.functions import from_avro
 from pyspark.sql.functions import (
-    avg, col, count, from_json, from_unixtime,
+    avg, col, count, from_unixtime,
     max, min, to_timestamp, unix_timestamp, window
 )
-from pyspark.sql.types import (
-    FloatType, IntegerType, LongType,
-    StringType, StructField, StructType
-)
-import sys
+from pyspark.sql.types import IntegerType, LongType
 
 # ========================================
 # Configuration
 # ========================================
 
-KAFKA_BROKER       = "localhost:9092"
-KAFKA_TOPIC        = "sensor-events"
-CASSANDRA_HOST     = "localhost"
-CASSANDRA_PORT     = "9042"
-CASSANDRA_KEYSPACE = "iot_analytics"
+KAFKA_BROKER        = "localhost:9092"
+KAFKA_TOPIC         = "sensor-events"
+CASSANDRA_HOST      = "localhost"
+CASSANDRA_PORT      = "9042"
+CASSANDRA_KEYSPACE  = "iot_analytics"
+SCHEMA_REGISTRY_URL = "http://localhost:8081"
+
+# ========================================
+# Fetch Avro schema from Schema Registry
+# ========================================
+# Must happen BEFORE SparkSession is created — from_avro() needs the
+# schema string at plan-construction time, not at execution time.
+# The subject follows Confluent's TopicNameStrategy: <topic>-value.
+
+def fetch_schema(registry_url: str, topic: str) -> str:
+    subject = f"{topic}-value"
+    url = f"{registry_url}/subjects/{subject}/versions/latest"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        schema_str = response.json()["schema"]
+        print(f"✓ Fetched schema for subject '{subject}' from Schema Registry")
+        return schema_str
+    except requests.exceptions.ConnectionError:
+        print(f"✗ Cannot reach Schema Registry at {registry_url}")
+        print("  Is the schema-registry container running? (docker-compose ps)")
+        sys.exit(1)
+    except requests.exceptions.HTTPError as e:
+        print(f"✗ Schema Registry returned an error: {e}")
+        sys.exit(1)
+
+print("Fetching Avro schema from Schema Registry...")
+avro_schema_str = fetch_schema(SCHEMA_REGISTRY_URL, KAFKA_TOPIC)
+print(f"  Schema: {avro_schema_str}\n")
 
 # ========================================
 # Initialize Spark Session
 # ========================================
-# JARs are resolved via --packages in the spark-submit command.
-# No spark.jars config needed here.
 
 print("Initializing Spark Session...")
 
@@ -50,19 +77,6 @@ try:
 except Exception as e:
     print(f"✗ Failed to create Spark session: {e}")
     sys.exit(1)
-
-# ========================================
-# Define Event Schema
-# ========================================
-
-event_schema = StructType([
-    StructField("device_id",   StringType(), False),
-    StructField("device_name", StringType(), True),
-    StructField("timestamp",   LongType(),   False),
-    StructField("temperature", FloatType(),  False),
-    StructField("humidity",    FloatType(),  False),
-    StructField("location",    StringType(), True)
-])
 
 # ========================================
 # Read from Kafka
@@ -87,17 +101,31 @@ except Exception as e:
     sys.exit(1)
 
 # ========================================
-# Parse JSON Events
+# Deserialize Avro payload
 # ========================================
+# The confluent-kafka AvroSerializer prepends a 5-byte header to every
+# message: 0x00 (magic byte) + 4-byte schema ID (big-endian int32).
+# Spark's from_avro() expects raw Avro binary with no header, so we
+# strip those first 5 bytes with substr(6, ...) before deserializing.
+# The large second argument to substr is just a safe upper bound on
+# message length — it does not allocate memory.
 
-print("Parsing JSON events...")
+print("Configuring Avro deserialization...")
 
 events_df = kafka_df \
-    .select(from_json(col("value").cast("string"), event_schema).alias("data")) \
+    .select(
+        from_avro(
+            col("value").substr(6, 100_000),  # strip 5-byte Confluent header
+            avro_schema_str                    # schema fetched from SR above
+        ).alias("data")
+    ) \
     .select("data.*") \
-    .withColumn("event_time", to_timestamp(from_unixtime(col("timestamp") / 1000)))
+    .withColumn(
+        "event_time",
+        to_timestamp(from_unixtime(col("timestamp") / 1000))
+    )
 
-print("✓ JSON parsing configured\n")
+print("✓ Avro deserialization configured\n")
 
 # ========================================
 # STREAM 1: Raw Events → sensor_events
@@ -189,11 +217,12 @@ print("✓ Aggregation stream started\n")
 # ========================================
 
 print("=" * 80)
-print("Spark Streaming Pipeline Active")
+print("Spark Streaming Pipeline Active  [Avro + Schema Registry]")
 print("=" * 80)
-print(f"Kafka Topic  : {KAFKA_TOPIC}")
-print(f"Cassandra    : {CASSANDRA_HOST}:{CASSANDRA_PORT}")
-print(f"Keyspace     : {CASSANDRA_KEYSPACE}")
+print(f"Kafka Topic     : {KAFKA_TOPIC}")
+print(f"Schema Registry : {SCHEMA_REGISTRY_URL}")
+print(f"Cassandra       : {CASSANDRA_HOST}:{CASSANDRA_PORT}")
+print(f"Keyspace        : {CASSANDRA_KEYSPACE}")
 print(f"\nStreams:")
 print(f"  1. Raw Events → sensor_events      (CL=ONE)")
 print(f"  2. Aggregates → hourly_aggregates  (CL=QUORUM)")
