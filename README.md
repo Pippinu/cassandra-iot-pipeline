@@ -123,6 +123,7 @@ docker exec cassandra-1 cqlsh -e \
 
 | Document | Description |
 |---|---|
+| [`docs/baseline-architecture.md`](./iot-cassandra-pipeline/docs/baseline-architecture.md) | Pipeline foundation: infrastructure setup, Cassandra schema design, compaction strategies, Spark dual-stream architecture |
 | [`docs/data-contracts.md`](./iot-cassandra-pipeline/docs/data-contracts.md) | Avro + Schema Registry implementation, schema evolution, BACKWARD compatibility |
 
 ---
