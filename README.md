@@ -123,7 +123,7 @@ docker exec cassandra-1 cqlsh -e \
 
 | Document | Description |
 |---|---|
-| [`docs/data-contracts.md`](./docs/data-contracts.md) | Avro + Schema Registry implementation, schema evolution, BACKWARD compatibility |
+| [`docs/data-contracts.md`](./iot-cassandra-pipeline/docs/data-contracts.md) | Avro + Schema Registry implementation, schema evolution, BACKWARD compatibility |
 
 ---
 
