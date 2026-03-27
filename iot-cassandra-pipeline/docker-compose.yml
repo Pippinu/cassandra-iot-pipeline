@@ -30,17 +30,18 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_HEAD_OPTS: "-Xmx512G -Xms256M" # Control JVM heap
+      KAFKA_HEAD_OPTS: "-Xmx512M -Xms256M" # Control JVM heap
     networks:
       - iot-network
     mem_limit: 1g
 
   # Cassandra Node 1 (seed node)
+# Cassandra Node 1 (seed node)
   cassandra-1:
     image: cassandra:4.1
     container_name: cassandra-1
     ports:
-      - "9042:9042"  # CQL port
+      - "9042:9042"
     environment:
       CASSANDRA_CLUSTER_NAME: IoT-Cluster
       CASSANDRA_DC: dc1
@@ -49,21 +50,24 @@ services:
       CASSANDRA_SEEDS: cassandra-1
       MAX_HEAP_SIZE: 512M
       HEAP_NEWSIZE: 200M
-    mem_limit: 1200m
+    mem_limit: 1500m # Increased slightly for safety
     volumes:
-      - cassandra-data-1:/var/lib/cassandra
+      - cassandra-data-1:/var/lib/cassandra # Added data persistence
+      - ./cassandra/init.cql:/docker-entrypoint-initdb.d/init.cql:ro
     networks:
       - iot-network
     healthcheck:
-      test: ["CMD-SHELL", "nodetool status"]
-      interval: 30s
+      test: ["CMD-SHELL", "nodetool status | grep UN"] # "UN" means Up and Normal
+      interval: 15s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 60s # Gives it a minute to breathe before checking
 
   # Cassandra Node 2
   cassandra-2:
     image: cassandra:4.1
     container_name: cassandra-2
+    command: /bin/bash -c "sleep 30 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
     environment:
       CASSANDRA_CLUSTER_NAME: IoT-Cluster
       CASSANDRA_DC: dc1
@@ -72,7 +76,7 @@ services:
       CASSANDRA_SEEDS: cassandra-1
       MAX_HEAP_SIZE: 512M
       HEAP_NEWSIZE: 200M
-    mem_limit: 1200m
+    mem_limit: 1500m
     volumes:
       - cassandra-data-2:/var/lib/cassandra
     networks:
@@ -85,6 +89,8 @@ services:
   cassandra-3:
     image: cassandra:4.1
     container_name: cassandra-3
+    # The 60-second sleep gives Node 2 a head start so they don't join the seed simultaneously
+    command: /bin/bash -c "sleep 60 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
     environment:
       CASSANDRA_CLUSTER_NAME: IoT-Cluster
       CASSANDRA_DC: dc1
@@ -93,9 +99,9 @@ services:
       CASSANDRA_SEEDS: cassandra-1
       MAX_HEAP_SIZE: 512M
       HEAP_NEWSIZE: 200M
-    mem_limit: 1200m
+    mem_limit: 1500m
     volumes:
-      - cassandra-data-3:/var/lib/cassandra
+      - cassandra-data-3:/var/lib/cassandra  # MUST BE unique to Node 3
     networks:
       - iot-network
     depends_on:
