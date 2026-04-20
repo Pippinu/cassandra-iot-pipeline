@@ -296,6 +296,47 @@ Cassandra does support secondary indexes, but applying them to **high-cardinalit
 
 **Best Practice**: If you need to search by a new column, create a new table where that column is the Partition Key. This trades cheap disk space for fast, predictable reads.
 
+### 3.5 Storage-Attached Index (SAI)
+
+**Storage-Attached Index (SAI)** is a modern secondary indexing mechanism introduced in Cassandra 4.0 (DataStax Astra) and made available in Apache Cassandra 5.0. It was designed to address the performance limitations of traditional secondary indexes (2i) described in section 3.4.
+
+Unlike classic secondary indexes — which are local, node-level structures that force a scatter-gather across the entire cluster — SAI attaches the index **directly to the SSTable files** on each node, using more efficient data structures (based on techniques like tries and segment trees) that make lookups significantly faster and less resource-intensive.
+
+```sql
+-- VERBOSE VERSION
+-- Creating an SAI index on a non-primary-key column
+CREATE CUSTOM INDEX city_index ON details_by_city_date(temperature)
+USING 'StorageAttachedIndex';
+
+-- OR BY
+
+-- SHORTHAND VERSION
+-- Creating an SAI index on a non-primary-key column
+CREATE INDEX ON details_by_city_date(temperature) USING 'sai';
+
+
+-- Now you can query by temperature without a full cluster scan
+-- Querying syntax remain the same, Cassandra will use the indexing column (temperature) 
+-- to perform a faster search
+SELECT * FROM details_by_city_date WHERE city='Venice' AND date='2025-03-31' AND temperature > 20.0;
+```
+
+The key practical difference is that SAI makes it **reasonable** to query on non-primary-key columns in certain scenarios, without the severe performance penalty of classic secondary indexes. 
+* However, it is not a silver bullet — queries still work best when the partition key is provided (as in the example above), and SAI is not a replacement for good query-first table design. 
+* It is best thought of as a **complement** to the query-first model for cases where creating a new dedicated table would be excessive, and the query volume or cardinality is manageable.
+
+#### Partition Key is still fundamental for performance
+
+While the query looks the same, the performance profile changes drastically. However, there is one crucial rule you must remember to get that "better performance":
+
+* The "Fast" Way: `SELECT * FROM details_by_city_date WHERE city = 'Rome' AND date='2025-03-31' AND temperature > 25;`
+
+    Why: You provided the Partition Key (city, date). Cassandra goes straight to one node, and that node uses the SAI to quickly find the specific temperature. This is highly scalable.
+
+* The "Heavy" Way: `SELECT * FROM details_by_city_date WHERE temperature > 25;`
+    
+    Why: You did not provide a Partition Key. Even with an SAI, Cassandra must ask every node in the cluster to check its local SAI for temperatures > 25.
+
 ---
 
 ## 4. LSM-Tree Storage Engine

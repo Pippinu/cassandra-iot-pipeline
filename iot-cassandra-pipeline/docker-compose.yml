@@ -1,16 +1,8 @@
-version: '3.8'
-
-# ============================================================
-# IoT Sensor Pipeline — Docker Compose
-# Services: Zookeeper, Kafka, Cassandra (3 nodes),
-#           Producer, Spark Consumer
-# Network:  iot-network (bridge)
-# ============================================================
-
 services:
-
   # ----------------------------------------------------------
-  # Zookeeper — required by Kafka for broker coordination
+  # Zookeeper — required by Kafka for broker coordination.
+  # Intentionally no healthcheck: the previous health-gated setup
+  # was causing false negatives during docker compose up -d.
   # ----------------------------------------------------------
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -23,23 +15,17 @@ services:
     networks:
       - iot-network
     mem_limit: 512m
-    healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
 
   # ----------------------------------------------------------
-  # Kafka broker — message bus for 3 sensor topic streams
-  # Topics: sensor_temp_humidity | sensor_light | sensor_power
+  # Kafka broker — message bus for the 3 sensor topic streams.
+  # Keep topic autocreation disabled and use kafka-init, but do
+  # not block startup on a fragile broker healthcheck.
   # ----------------------------------------------------------
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
     depends_on:
-      zookeeper:
-        condition: service_healthy
+      - zookeeper
     ports:
       - "9092:9092"
     environment:
@@ -49,47 +35,72 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics created explicitly below
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_HEAP_OPTS: "-Xmx512M -Xms256M"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     networks:
       - iot-network
     mem_limit: 1g
-    healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
 
-  # ----------------------------------------------------------
-  # Kafka topic initializer — creates the 3 sensor topics
-  # once the broker is healthy, then exits cleanly.
-  # ----------------------------------------------------------
   kafka-init:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka-init
     depends_on:
-      kafka:
-        condition: service_healthy
+      - kafka
     networks:
-      - iot-networkk
+      - iot-network
+    command:
+      - /bin/bash
+      - -ec
+      - |
+          set -o pipefail
+          echo '--- kafka-init starting ---'
+          echo '--- Waiting for Kafka broker ---'
+          cub kafka-ready -b kafka:29092 1 120
+          echo '--- Kafka is ready ---'
+          echo '--- Topics before creation ---'
+          kafka-topics --bootstrap-server kafka:29092 --list || true
+          echo '--- Creating Kafka topics ---'
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_temp_humidity --partitions 3 --replication-factor 1
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_light --partitions 3 --replication-factor 1
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_power --partitions 3 --replication-factor 1
+          echo '--- Topics after creation ---'
+          kafka-topics --bootstrap-server kafka:29092 --list
+          echo '--- kafka-init done ---'
+    restart: "no"
+
+  # Manual CQL execution alternative to cassandra-init.
+  # docker exec -it cassandra-1 cqlsh -f /docker-entrypoint-initdb.d/init.cql
+
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: cassandra-init
+    depends_on:
+      cassandra-1:
+        condition: service_healthy
+    volumes:
+      - ./cassandra/init.cql:/init.cql:ro
+    networks:
+      - iot-network
     entrypoint: ["/bin/bash", "-c"]
     command: |
-      "
-      echo 'Creating Kafka topics...'
-      kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists         --topic sensor_temp_humidity --partitions 3 --replication-factor 1
-      kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists         --topic sensor_light --partitions 3 --replication-factor 1
-      kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists         --topic sensor_power --partitions 3 --replication-factor 1
-      echo 'Topics created:'
-      kafka-topics.sh --bootstrap-server kafka:29092 --list
-      echo 'kafka-init done.'
-      "
+      echo '--- Waiting for Cassandra CQL ---'
+      until cqlsh cassandra-1 9042 -e "DESCRIBE KEYSPACES" > /dev/null 2>&1; do
+        sleep 5
+      done
+      echo '--- Applying schema ---'
+      cqlsh cassandra-1 9042 -f /init.cql
+      echo '--- Verifying schema ---'
+      cqlsh cassandra-1 9042 -e "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name IN ('iot_raw','iot_alerts','iot_analytics');"
+      echo '--- cassandra-init done ---'
     restart: "no"
 
   # ----------------------------------------------------------
-  # Cassandra Node 1 — seed node
-  # Exposes CQL port 9042 for external cqlsh access.
-  # Mounts init.cql for schema initialization on first start.
+  # Cassandra Node 1 — seed node.
+  # Healthcheck uses nodetool UN, which is a much stronger
+  # readiness signal than cqlsh responding early.
   # ----------------------------------------------------------
   cassandra-1:
     image: cassandra:4.1
@@ -104,27 +115,27 @@ services:
       CASSANDRA_SEEDS: cassandra-1
       MAX_HEAP_SIZE: 512M
       HEAP_NEWSIZE: 200M
-    mem_limit: 1500m
+    mem_limit: 1800m
     volumes:
       - cassandra-data-1:/var/lib/cassandra
       - ./cassandra/init.cql:/docker-entrypoint-initdb.d/init.cql:ro
     networks:
       - iot-network
     healthcheck:
-      test: ["CMD-SHELL", "nodetool status | grep -E '^UN\\s+' | grep -v grep"]
-      interval: 15s
+      test: ["CMD-SHELL", "nodetool status | grep -q '^UN'"]
+      interval: 20s
       timeout: 10s
       retries: 15
-      start_period: 60s
+      start_period: 90s
 
   # ----------------------------------------------------------
-  # Cassandra Node 2 — joins after node 1 is healthy
-  # 30s sleep prevents simultaneous ring join with node 3.
+  # Cassandra Node 2 — joins after node 1 is truly Up/Normal.
+  # Extra delay remains to reduce bootstrap overlap.
   # ----------------------------------------------------------
   cassandra-2:
     image: cassandra:4.1
     container_name: cassandra-2
-    command: /bin/bash -c "sleep 30 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
+    command: /bin/bash -c "sleep 45 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
     depends_on:
       cassandra-1:
         condition: service_healthy
@@ -142,20 +153,20 @@ services:
     networks:
       - iot-network
     healthcheck:
-      test: ["CMD-SHELL", "nodetool status | grep -E '^UN\\s+' | wc -l | grep -qv '^0'"]
-      interval: 15s
+      test: ["CMD-SHELL", "nodetool status | grep -q '^UN'"]
+      interval: 20s
       timeout: 10s
       retries: 15
-      start_period: 60s
+      start_period: 120s
 
   # ----------------------------------------------------------
-  # Cassandra Node 3 — joins 60s after node 2 starts
-  # Extra delay ensures node 2 has fully joined the ring first.
+  # Cassandra Node 3 — wait longer and depend on the seed node
+  # being healthy, mirroring the older working strategy.
   # ----------------------------------------------------------
   cassandra-3:
     image: cassandra:4.1
     container_name: cassandra-3
-    command: /bin/bash -c "sleep 60 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
+    command: /bin/bash -c "sleep 120 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
     depends_on:
       cassandra-1:
         condition: service_healthy
@@ -173,76 +184,63 @@ services:
     networks:
       - iot-network
     healthcheck:
-      test: ["CMD-SHELL", "nodetool status | grep -E '^UN\\s+' | wc -l | grep -qv '^0'"]
-      interval: 15s
+      test: ["CMD-SHELL", "nodetool status | grep -q '^UN'"]
+      interval: 20s
       timeout: 10s
       retries: 15
-      start_period: 90s
+      start_period: 150s
 
   # ----------------------------------------------------------
-  # Producer — simulates 90 sensors across 3 types and 3 rooms.
-  # Starts only after Kafka is healthy and topics are created.
-  # Built from Dockerfile.producer (lightweight Python image).
+  # Producer — run when ready.
   # ----------------------------------------------------------
-  producer:
-    build:
-      context: .
-      dockerfile: Dockerfile.producer
-    container_name: producer
-    depends_on:
-      kafka:
-        condition: service_healthy
-      kafka-init:
-        condition: service_completed_successfully
-    environment:
-      KAFKA_BROKER: kafka:29092
-    networks:
-      - iot-network
-    mem_limit: 256m
-    restart: on-failure
+  # producer:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.producer
+  #   container_name: producer
+  #   depends_on:
+  #     - kafka
+  #     kafka-init:
+  #       condition: service_completed_successfully
+  #   environment:
+  #     KAFKA_BROKER: kafka:29092
+  #   networks:
+  #     - iot-network
+  #   mem_limit: 256m
+  #   restart: on-failure
 
   # ----------------------------------------------------------
-  # Spark Consumer — reads from 3 Kafka topics, writes to
-  # Cassandra across 3 keyspaces, computes 30s aggregates.
-  # Starts only after Kafka and Cassandra node 1 are healthy.
-  # Built from Dockerfile.spark (PySpark + connector JARs).
+  # Spark Consumer — run when ready.
   # ----------------------------------------------------------
-  spark-consumer:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
-    container_name: spark-consumer
-    depends_on:
-      kafka:
-        condition: service_healthy
-      kafka-init:
-        condition: service_completed_successfully
-      cassandra-1:
-        condition: service_healthy
-    environment:
-      KAFKA_BROKER: kafka:29092
-      CASSANDRA_HOST: cassandra-1
-      CASSANDRA_PORT: "9042"
-    volumes:
-      - spark-checkpoints:/tmp/spark-checkpoints
-    networks:
-      - iot-network
-    mem_limit: 1500m
-    restart: on-failure
+  # spark-consumer:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.spark
+  #   container_name: spark-consumer
+  #   depends_on:
+  #     - kafka
+  #     kafka-init:
+  #       condition: service_completed_successfully
+  #     cassandra-1:
+  #       condition: service_healthy
+  #   environment:
+  #     KAFKA_BROKER: kafka:29092
+  #     CASSANDRA_HOST: cassandra-1
+  #     CASSANDRA_PORT: "9042"
+  #   volumes:
+  #     - spark-checkpoints:/tmp/spark-checkpoints
+  #   networks:
+  #     - iot-network
+  #   mem_limit: 1500m
+  #   restart: on-failure
 
-# ============================================================
-# Volumes — persistent storage for Cassandra data and
-#           Spark streaming checkpoints
-# ============================================================
 volumes:
   cassandra-data-1:
   cassandra-data-2:
   cassandra-data-3:
+  kafka-data:
   spark-checkpoints:
 
-# ============================================================
-# Network — isolated bridge network for all services
-# ============================================================
 networks:
   iot-network:
     driver: bridge

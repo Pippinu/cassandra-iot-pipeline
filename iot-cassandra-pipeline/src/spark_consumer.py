@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+"""
+Spark Structured Streaming Consumer — IoT Sensor Pipeline
+
+Reads from 3 Kafka topics, writes to 3 Cassandra keyspaces:
+
+  iot_raw       → temp_humidity_by_sensor, light_by_sensor, power_by_sensor,
+                  readings_by_location (intentionally sparse)
+  iot_analytics → sensor_aggregates_30s, aggregates_by_type
+  iot_alerts    → sensor_alerts (threshold-based, via foreachBatch)
+
+Run with:
+    spark-submit \
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,\
+com.datastax.spark:spark-cassandra-connector_2.12:3.5.0 \
+      spark_consumer.py
+
+spark-submit \
+  --master local[2] \
+  --conf "spark.kafka.offset.reader=consumer" \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.datastax.spark:spark-cassandra-connector_2.12:3.5.0 \
+  spark_consumer.py
+"""
+
+import os
+import uuid as uuid_lib
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import (
+    from_json,
+    col,
+    from_unixtime,
+    to_date,
+    window,
+    avg,
+    min,
+    max,
+    count,
+    lit,
+    when,
+    concat_ws,
+    udf,
+)
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    FloatType,
+    TimestampType,
+    LongType,
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
+CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "localhost")
+CASSANDRA_PORT = int(os.getenv("CASSANDRA_PORT", "9042"))
+CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "/tmp/spark_checkpoints")
+
+# Keyspace and table names. Must match the CQL schema in init.cql and the
+# keyspace/table names used in cassandra_sink() below. The raw tables and
+# analytics tables have different partition keys but the same table names across keyspaces, 
+# demonstrating how the same data can be organized differently for different query patterns.
+KS_RAW = "iot_raw"
+KS_ANALYTICS = "iot_analytics"
+KS_ALERTS = "iot_alerts"
+
+TOPICS = {
+    "temp_humidity": "sensor_temp_humidity",
+    "light": "sensor_light",
+    "power": "sensor_power",
+}
+
+# Must mirror producer.py THRESHOLDS exactly so spike-generated anomalies
+# trigger alerts in the consumer as expected during the demo.
+THRESHOLDS = {
+    "temperature_high": 40.0,
+    "temperature_low": 5.0,
+    "humidity_high": 85.0,
+    "humidity_low": 20.0,
+    "light_high": 900.0,
+    "voltage_high": 240.0,
+    "amperage_high": 10.0,
+}
+
+# Schemas for parsing the JSON messages from Kafka. Must match the producer's
+# output exactly. The base fields are common to all three sensor types, then
+# each has its own specific fields. All fields must be present in the schema
+# even if they are null in some messages — Spark's from_json() requires a
+# consistent schema across all messages in a topic.
+BASE_FIELDS = [
+    StructField("sensor_id", StringType(), False),
+    StructField("sensor_type", StringType(), False),
+    StructField("location_id", StringType(), False),
+    StructField("description", StringType(), False),
+    StructField("timestamp", LongType(), False),
+]
+
+SCHEMA_TEMP_HUMIDITY = StructType(
+    BASE_FIELDS
+    + [
+        StructField("temperature", FloatType(), True),
+        StructField("humidity", FloatType(), True),
+    ]
+)
+
+SCHEMA_LIGHT = StructType(
+    BASE_FIELDS
+    + [
+        StructField("light_level", FloatType(), True),
+    ]
+)
+
+SCHEMA_POWER = StructType(
+    BASE_FIELDS
+    + [
+        StructField("voltage", FloatType(), True),
+        StructField("amperage", FloatType(), True),
+    ]
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SparkSession
+# ──────────────────────────────────────────────────────────────────────────────
+
+spark = (
+    # Entry point: creates a new session or reattaches to an existing one.
+    # appName identifies this job in the Spark UI and logs.
+    SparkSession.builder.appName("IoT-Sensor-Consumer")
+    # Tell the Cassandra connector which node to contact for the initial connection.
+    # Any node works — the driver discovers the full ring automatically via gossip.
+    .config("spark.cassandra.connection.host", CASSANDRA_HOST)
+    # Native CQL port. Needs to match the port exposed in docker-compose.yml.
+    .config("spark.cassandra.connection.port", str(CASSANDRA_PORT))
+    # Directory where Spark persists Kafka offsets and query progress.
+    # Allows a crashed query to resume exactly where it left off without data loss.
+    .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_DIR)
+    # On SIGTERM, let all active micro-batches finish before shutting down
+    # instead of killing them mid-write, preventing partial Cassandra writes.
+    .config("spark.streaming.stopGracefullyOnShutdown", "true")
+    # Finalise the builder: returns the session, reusing it if already running.
+    .getOrCreate()
+)
+
+# Control the verbosity of the logs generated by Apache Spark
+# The other log levels are: ALL < DEBUG < INFO < WARN < ERROR < FATAL < OFF
+spark.sparkContext.setLogLevel("ERROR")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def read_topic(topic: str) -> DataFrame:
+    """
+    Subscribe to a Kafka topic as a Structured Streaming source.
+    startingOffsets=latest: only process new messages, skip history.
+    failOnDataLoss=false: survive Kafka log compaction without crashing.
+    """
+    return (
+        # Create a streaming source from Kafka.
+        spark.readStream.format("kafka")
+        # Kafka broker address used by the consumer.
+        .option("kafka.bootstrap.servers", KAFKA_BROKER)
+        # Topic to subscribe to.
+        .option("subscribe", topic)
+        # Start from new records only.
+        .option("startingOffsets", "latest")
+        # Do not fail if some old offsets are no longer available.
+        .option("failOnDataLoss", "false")
+        .load()
+        # Keep only the payload as a string for JSON parsing.
+        .selectExpr("CAST(value AS STRING) AS json_str")
+    )
+
+
+def add_time_columns(df: DataFrame) -> DataFrame:
+    """
+    Convert Unix-ms timestamp → TimestampType and extract a DateType date column.
+    The date column is required by the composite partition keys (sensor_id, date)
+    in all three raw tables and in both analytics tables.
+    Division by 1000 converts ms → seconds, which from_unixtime expects.
+    """
+    return df.withColumn(
+        # Convert epoch milliseconds to a proper Spark timestamp.
+        # 1) divide by 1000 to get epoch seconds
+        # 2) convert to timestamp and enforce TimestampType
+        "timestamp", from_unixtime(col("timestamp") / 1000).cast(TimestampType())
+    ).withColumn(
+        # Extract only the calendar date from the timestamp
+        # for Cassandra partitioning and date-based analytics.
+        "date", to_date(col("timestamp"))
+    )
+
+
+def cassandra_sink(df: DataFrame, keyspace: str, table: str, suffix: str):
+    """
+    Append-mode Cassandra streaming sink with its own checkpoint directory.
+    DataFrame column names must exactly match the Cassandra table columns.
+    Unmentioned non-key columns are left absent in Cassandra — zero bytes
+    on disk, demonstrating the LSM-tree sparse storage model.
+    """
+    return (
+        # Start from the streaming writer on the incoming DataFrame.
+        df.writeStream.format("org.apache.spark.sql.cassandra")
+        # Select Cassandra destination (keyspace + table).
+        .options(table=table, keyspace=keyspace)
+        # Use a dedicated checkpoint path to persist stream progress/state.
+        .option("checkpointLocation", f"{CHECKPOINT_DIR}/{suffix}")
+        # Append only new rows generated by each micro-batch.
+        .outputMode("append")
+        # Start the continuous streaming query and return its handle.
+        .start()
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parse Kafka topics
+# .select("d.*") flattens all parsed struct fields into top-level columns.
+# sensor_id arrives as a valid UUID string; the Cassandra connector
+# auto-converts it to the uuid column type — no explicit cast needed.
+# ──────────────────────────────────────────────────────────────────────────────
+
+raw_power = (
+    # Open Kafka topic as an infinite streaming source.
+    # Each row = one raw Kafka message; the payload lives in a binary 'value' column,
+    # pre-cast to string as 'json_str' inside read_topic().
+    read_topic(TOPICS["power"])
+    # Parse the JSON string into a typed nested struct 'd' using the declared schema.
+    # Schema must be explicit: in streaming Spark cannot scan data to infer types.
+    .select(from_json(col("json_str"), SCHEMA_POWER).alias("d"))
+    # Flatten the struct into individual top-level columns (sensor_id, voltage, amperage, …).
+    .select("d.*")
+    # Cast the Unix-ms timestamp to TimestampType and add a 'date' bucket column
+    # matching the composite partition key (sensor_id, date) in Cassandra.
+    .transform(add_time_columns)
+)
+
+raw_th = (
+    read_topic(TOPICS["temp_humidity"])
+    .select(from_json(col("json_str"), SCHEMA_TEMP_HUMIDITY).alias("d"))
+    .select("d.*")
+    .transform(add_time_columns)
+)
+
+raw_light = (
+    read_topic(TOPICS["light"])
+    .select(from_json(col("json_str"), SCHEMA_LIGHT).alias("d"))
+    .select("d.*")
+    .transform(add_time_columns)
+)
+
+
+# wattage is computed in Spark rather than the producer, demonstrating
+# in-flight enrichment.
+raw_power_enriched = raw_power.withColumn("wattage", col("voltage") * col("amperage"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# iot_raw — typed raw tables
+# Partition key (sensor_id, date) bounds each partition to one day per sensor,
+# roughly 86400 rows/day at 1 msg/sec. timestamp DESC clustering returns the
+# most recent readings first, matching the expected CQL query pattern.
+# ──────────────────────────────────────────────────────────────────────────────
+
+q1 = cassandra_sink(
+    # Select only the columns that exist in the target Cassandra table.
+    # The full raw_th DataFrame may contain extra columns (e.g. 'date' for
+    # partitioning other tables) that don't belong here — this trims it down.
+    raw_th.select(
+        "sensor_id", "date", "timestamp", "location_id", "temperature", "humidity"
+    ),
+    # Cassandra keyspace
+    KS_RAW,
+    # Casandra table
+    "temp_humidity_by_sensor",
+    # Suffix for the checkpoint directory used by this query to persist its progress.
+    "th_raw",
+)
+
+q2 = cassandra_sink(
+    raw_light.select("sensor_id", "date", "timestamp", "location_id", "light_level"),
+    KS_RAW,
+    "light_by_sensor",
+    "light_raw",
+)
+
+q3 = cassandra_sink(
+    raw_power_enriched.select(
+        "sensor_id", "date", "timestamp", "location_id", "voltage", "amperage", "wattage"
+    ),
+    KS_RAW,
+    "power_by_sensor",
+    "power_raw",
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# iot_raw — readings_by_location  (intentionally sparse)
+# PRIMARY KEY ((location_id, date), timestamp, sensor_id)
+#
+# Three independent queries write to the same table, each with its own
+# checkpoint. Each writes only its own value columns — other columns are never
+# written, so they remain absent (not null) in Cassandra. This demonstrates the
+# LSM-tree storage model where rows are sparse and only consume disk space for
+# the columns that are actually present, unlike a fixed-width row in a traditional
+# RDBMS that preallocates space for all columns regardless of values.
+#
+# This is the key demo slide: a SELECT * on this table shows rows where some
+# columns are empty for every row, but unlike a RDBMS fixed-width row that
+# preallocates space for all columns regardless of values, the LSM-tree engine
+# allocates zero bytes for absent cells.
+#
+# Cassandra handles concurrent appends from multiple writers safely via
+# last-write-wins at the individual cell level.
+# ──────────────────────────────────────────────────────────────────────────────
+
+q4a = cassandra_sink(
+    raw_th.select(
+        "location_id",
+        "date",
+        "timestamp",
+        "sensor_id",
+        "sensor_type",
+        "temperature",
+        "humidity",
+    ),
+    KS_RAW,
+    "readings_by_location",
+    "loc_th",
+)
+
+q4b = cassandra_sink(
+    raw_light.select(
+        "location_id", "date", "timestamp", "sensor_id", "sensor_type", "light_level"
+    ),
+    KS_RAW,
+    "readings_by_location",
+    "loc_light",
+)
+
+q4c = cassandra_sink(
+    raw_power_enriched.select(
+        "location_id",
+        "date",
+        "timestamp",
+        "sensor_id",
+        "sensor_type",
+        "voltage",
+        "amperage",
+    ),
+    KS_RAW,
+    "readings_by_location",
+    "loc_power",
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# iot_raw — devices_metadata
+# Keeps one reference row per sensor so sensor IDs can be discovered later
+# by sensor_type without scanning a sensor_id-keyed table.
+# NOTE: producer messages do not contain a description field, so we synthesize
+# a simple one here.
+# ──────────────────────────────────────────────────────────────────────────────
+
+metadata_stream = (
+    raw_th.select("sensor_id", "sensor_type", "location_id", "description")
+    .unionByName(raw_light.select("sensor_id", "sensor_type", "location_id", "description"))
+    .unionByName(raw_power_enriched.select("sensor_id", "sensor_type", "location_id", "description"))
+)
+
+def write_metadata_batch(batch_df, batch_id):
+    if batch_df.isEmpty():
+        return
+
+    metadata_df = (
+        batch_df.select("sensor_id", "sensor_type", "location_id", "description")
+        .dropDuplicates(["sensor_type", "sensor_id"])
+    )
+
+    metadata_df.write.format("org.apache.spark.sql.cassandra") \
+        .options(table="devices_metadata", keyspace=KS_RAW) \
+        .mode("append") \
+        .save()
+
+q5 = (
+    metadata_stream.writeStream.foreachBatch(write_metadata_batch)
+    .option("checkpointLocation", f"{CHECKPOINT_DIR}/devices_metadata")
+    .outputMode("append")
+    .start()
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# iot_analytics — sensor_aggregates_30s
+# 30-second tumbling window per sensor. One primary metric per sensor type:
+#   temp_humidity → temperature   (the most demo-relevant metric)
+#   light         → light_level
+#   power         → wattage       (derived, not stored in the raw table)
+#
+# withWatermark("1 minute"): Spark finalizes a window and emits its result
+# in append mode only after the watermark passes the window's end time.
+# Without a watermark, append mode is illegal for aggregations.
+#
+# reading_count cast to int: Spark's count() returns LongType (bigint) but
+# the Cassandra column is declared as int — cast avoids a type mismatch error.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def build_sensor_aggregates(df: DataFrame, metric_col: str) -> DataFrame:
+    return (
+        # Set a watermark to allow Spark to manage state and emit results in append mode.
+        df.withWatermark("timestamp", "1 minute")
+        # Group by 30s tumbling window and sensor_id to get per-sensor aggregates every 30 seconds.
+        .groupBy(
+            window(col("timestamp"), "30 seconds"),
+            col("sensor_id"),
+            col("sensor_type"),
+            col("location_id"),
+        )
+        # Aggregate the specified metric column with avg, min, max, and count of readings in the window.
+        .agg(
+            avg(metric_col).alias("avg_value"),
+            min(metric_col).alias("min_value"),
+            max(metric_col).alias("max_value"),
+            count("*").cast("int").alias("reading_count"),
+        )
+        # Select and rename columns to match the target Cassandra table schema.
+        .select(
+            col("sensor_id"),
+            to_date(col("window.start")).alias("date"),
+            col("window.start").alias("window_start"),
+            col("sensor_type"),
+            col("location_id"),
+            col("avg_value"),
+            col("min_value"),
+            col("max_value"),
+            col("reading_count"),
+        )
+    )
+
+# Three independent queries write to the same table, each with its own checkpoint.
+q6 = cassandra_sink(
+    build_sensor_aggregates(raw_th, "temperature"),
+    KS_ANALYTICS,
+    "sensor_aggregates_30s",
+    "agg_th",
+)
+
+q7 = cassandra_sink(
+    build_sensor_aggregates(raw_light, "light_level"),
+    KS_ANALYTICS,
+    "sensor_aggregates_30s",
+    "agg_light",
+)
+
+q8 = cassandra_sink(
+    build_sensor_aggregates(raw_power_enriched, "wattage"),
+    KS_ANALYTICS,
+    "sensor_aggregates_30s",
+    "agg_power",
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# iot_analytics — aggregates_by_type
+# Same 30s window but partition key is (sensor_type, date) instead of
+# (sensor_id, date). Enables cross-sensor queries:
+#   "What is the average temperature across all sensors right now?"
+# Only avg_value is stored — matches the table schema (no min/max columns).
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def build_type_aggregates(df: DataFrame, metric_col: str) -> DataFrame:
+    return (
+        df.withWatermark("timestamp", "1 minute")
+        .groupBy(
+            window(col("timestamp"), "30 seconds"),
+            col("sensor_type"),
+            col("sensor_id"),
+            col("location_id"),
+        )
+        .agg(avg(metric_col).alias("avg_value"))
+        .select(
+            col("sensor_type"),
+            to_date(col("window.start")).alias("date"),
+            col("window.start").alias("window_start"),
+            col("sensor_id"),
+            col("location_id"),
+            col("avg_value"),
+        )
+    )
+
+
+q9 = cassandra_sink(
+    build_type_aggregates(raw_th, "temperature"),
+    KS_ANALYTICS,
+    "aggregates_by_type",
+    "aggtype_th",
+)
+
+q10 = cassandra_sink(
+    build_type_aggregates(raw_light, "light_level"),
+    KS_ANALYTICS,
+    "aggregates_by_type",
+    "aggtype_light",
+)
+
+q11 = cassandra_sink(
+    build_type_aggregates(raw_power_enriched, "wattage"),
+    KS_ANALYTICS,
+    "aggregates_by_type",
+    "aggtype_power",
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# iot_alerts — sensor_alerts  (foreachBatch)
+#
+# foreachBatch is used instead of the native Cassandra sink because alert
+# generation requires conditional logic (threshold comparison) and computed
+# columns (alert_id, alert_type, severity, alert_message) that cannot be
+# expressed in the declarative streaming sink API.
+#
+# The three source streams are unioned into one combined stream after padding
+# each with null columns for the fields they don't carry, giving a uniform
+# schema the union requires. detect_alerts() then filters threshold-crossing
+# rows and enriches them with alert metadata.
+#
+# alert_id is a freshly generated UUID per row — prevents silent overwrites
+# when two alerts fire within the same millisecond on the same sensor
+# (alert_id is the tertiary clustering column in sensor_alerts, guaranteeing
+# row uniqueness as documented in the init.cql comment).
+# ──────────────────────────────────────────────────────────────────────────────
+
+gen_uuid = udf(lambda: str(uuid_lib.uuid4()), StringType())
+
+
+def detect_alerts(df: DataFrame) -> DataFrame:
+    """
+    Filter rows breaching any configured threshold and enrich with alert metadata.
+    Returns an empty DataFrame if no threshold is crossed in this micro-batch.
+    """
+    return (
+        # Add an 'alert_type' column based on sensor type and which threshold is breached.
+        # when()...otherwise() is Spark's way to express if...elif...else logic in a column expression.
+        df.withColumn(
+            "alert_type",
+            when(
+                (col("sensor_type") == "temp_humidity")
+                & (col("temperature") > THRESHOLDS["temperature_high"]),
+                lit("TEMPERATURE_HIGH"),
+            )
+            .when(
+                (col("sensor_type") == "temp_humidity")
+                & (col("temperature") < THRESHOLDS["temperature_low"]),
+                lit("TEMPERATURE_LOW"),
+            )
+            .when(
+                (col("sensor_type") == "temp_humidity")
+                & (col("humidity") > THRESHOLDS["humidity_high"]),
+                lit("HUMIDITY_HIGH"),
+            )
+            .when(
+                (col("sensor_type") == "light")
+                & (col("light_level") > THRESHOLDS["light_high"]),
+                lit("LIGHT_HIGH"),
+            )
+            .when(
+                (col("sensor_type") == "power")
+                & (col("voltage") > THRESHOLDS["voltage_high"]),
+                lit("VOLTAGE_HIGH"),
+            )
+            .when(
+                (col("sensor_type") == "power")
+                & (col("amperage") > THRESHOLDS["amperage_high"]),
+                lit("AMPERAGE_HIGH"),
+            )
+            .otherwise(None),
+        )
+        .filter(col("alert_type").isNotNull())
+        .withColumn("alert_id", gen_uuid())
+        # Assign severity based on alert type: temperature, voltage, and amperage 
+        # breaches are HIGH severity; humidity and light breaches are MEDIUM.
+        .withColumn(
+            "severity",
+            when(
+                col("alert_type").isin(
+                    "TEMPERATURE_HIGH", "VOLTAGE_HIGH", "AMPERAGE_HIGH"
+                ),
+                lit("HIGH"),
+            ).otherwise(lit("MEDIUM")),
+        )
+        .withColumn(
+            "alert_message",
+            concat_ws(
+                " ",
+                lit("Threshold breached:"),
+                col("alert_type"),
+                lit("— sensor"),
+                col("sensor_id"),
+            ),
+        )
+        .select(
+            col("sensor_id"),
+            col("timestamp"),
+            col("alert_id"),
+            col("location_id"),
+            col("alert_type"),
+            col("alert_message"),
+            col("severity"),
+        )
+    )
+
+# This function is called for each micro-batch of the combined stream. 
+# It detects threshold breaches and writes any resulting alerts to Cassandra.
+# Even if batch_id is not used here, it must be accepted as a parameter to conform to the foreachBatch API.
+def write_alerts_batch(batch_df, batch_id):
+    if batch_df.isEmpty():
+        return
+    alerts = detect_alerts(batch_df)
+    if not alerts.isEmpty():
+        (
+            alerts.write.format("org.apache.spark.sql.cassandra")
+            .options(table="sensor_alerts", keyspace=KS_ALERTS)
+            .mode("append")
+            .save()
+        )
+
+
+# Pad each stream with null columns to produce a uniform schema for union.
+# The union is needed so a single foreachBatch query checks thresholds
+# across all three sensor types in one pass.
+th_for_alerts = (
+    raw_th.withColumn("light_level", lit(None).cast(FloatType()))
+    .withColumn("voltage", lit(None).cast(FloatType()))
+    .withColumn("amperage", lit(None).cast(FloatType()))
+    .select(
+        "sensor_id",
+        "sensor_type",
+        "location_id",
+        "timestamp",
+        "temperature",
+        "humidity",
+        "light_level",
+        "voltage",
+        "amperage",
+    )
+)
+
+light_for_alerts = (
+    raw_light.withColumn("temperature", lit(None).cast(FloatType()))
+    .withColumn("humidity", lit(None).cast(FloatType()))
+    .withColumn("voltage", lit(None).cast(FloatType()))
+    .withColumn("amperage", lit(None).cast(FloatType()))
+    .select(
+        "sensor_id",
+        "sensor_type",
+        "location_id",
+        "timestamp",
+        "temperature",
+        "humidity",
+        "light_level",
+        "voltage",
+        "amperage",
+    )
+)
+
+power_for_alerts = (
+    raw_power_enriched.withColumn("temperature", lit(None).cast(FloatType()))
+    .withColumn("humidity", lit(None).cast(FloatType()))
+    .withColumn("light_level", lit(None).cast(FloatType()))
+    .select(
+        "sensor_id",
+        "sensor_type",
+        "location_id",
+        "timestamp",
+        "temperature",
+        "humidity",
+        "light_level",
+        "voltage",
+        "amperage",
+    )
+)
+
+q11 = (
+    th_for_alerts.union(light_for_alerts)
+    .union(power_for_alerts)
+    .writeStream.foreachBatch(write_alerts_batch)
+    .option("checkpointLocation", f"{CHECKPOINT_DIR}/alerts")
+    .outputMode("append")
+    .start()
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Keep alive
+# awaitAnyTermination() blocks until any query fails or Ctrl+C is received.
+# stopGracefullyOnShutdown ensures in-flight micro-batches finish writing
+# before the driver process exits.
+# ──────────────────────────────────────────────────────────────────────────────
+
+active_count = len(spark.streams.active)
+print(f"\n[Spark] IoT Consumer started — {active_count} active streaming queries")
+print(f"[Spark] Cassandra : {CASSANDRA_HOST}:{CASSANDRA_PORT}")
+print(f"[Spark] Keyspaces : {KS_RAW} | {KS_ANALYTICS} | {KS_ALERTS}")
+print("[Spark] Press Ctrl+C to stop gracefully.\n")
+
+spark.streams.awaitAnyTermination()

@@ -30,16 +30,17 @@ USE iot_raw;
 -- ------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS devices_metadata (
-    sensor_id   uuid        PRIMARY KEY,
+    sensor_id   uuid,
     sensor_type text,
     location_id text,
-    description text
+    description text,
+    PRIMARY KEY (sensor_type, sensor_id)
 )
 WITH compaction = {
     'class': 'LeveledCompactionStrategy',
     'sstable_size_in_mb': 160
 }
-AND comment = 'Static sensor reference data. Simple partition key: no range scans needed. LCS for read-optimized access.';
+AND comment = 'Static sensor reference data. Partition key is sensor_type (3 partitions) with sensor_id as clustering column. Leveled compaction for read-optimized access.';
 
 -- ------------------------------------------------------------
 -- TABLE: temp_humidity_by_sensor
@@ -106,7 +107,8 @@ CREATE TABLE IF NOT EXISTS power_by_sensor (
     timestamp   timestamp,
     location_id text,
     amperage    float,
-    voltage     float,
+    voltage     float,      
+    wattage     float,      -- derived by Spark: voltage * amperage
     PRIMARY KEY ((sensor_id, date), timestamp)
 )
 WITH CLUSTERING ORDER BY (timestamp DESC)
@@ -115,7 +117,7 @@ AND compaction = {
     'min_threshold': 4,
     'max_threshold': 32
 }
-AND comment = 'Raw power readings. Composite partition key caps partition size to one day per sensor. STCS for write throughput.';
+AND comment = 'Raw power readings enriched by Spark. wattage is absent from Kafka messages and computed in-flight as voltage * amperage. STCS for write throughput.';
 
 -- ------------------------------------------------------------
 -- TABLE: readings_by_location
@@ -148,6 +150,7 @@ CREATE TABLE IF NOT EXISTS readings_by_location (
     -- power sensor columns (absent for temp/humidity and light rows)
     amperage    float,
     voltage     float,
+    wattage     float,    -- derived by Spark: voltage * amperage
     PRIMARY KEY ((location_id, date), timestamp, sensor_id)
 )
 WITH CLUSTERING ORDER BY (timestamp DESC, sensor_id ASC)
