@@ -280,6 +280,39 @@ AND compaction = {
 }
 AND comment = 'Cross-sensor aggregates by type. Partition key enables efficient type-wide analytics. LCS for read-optimized queries.';
 
+-- ------------------------------------------------------------
+-- TABLE: sensor_behavior_profiles
+-- Purpose: Latest rolling behavior profile per sensor for ANN.
+-- Query:   "within room X and sensor type Y, find sensors with
+--          behavior similar to this anomalous profile"
+-- Key design: partition key is (location_id, sensor_type) so
+--             ANN compares only peer sensors in the same room
+--             and same sensor family. sensor_id is clustering
+--             key so each sensor has exactly one latest row.
+-- Compaction: Leveled — read-oriented analytical lookup table.
+-- ------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS sensor_behavior_profiles (
+    location_id      text,
+    sensor_type      text,
+    sensor_id        uuid,
+    last_updated_at  timestamp,
+    profile_size     int,
+    mean_value       float,
+    variance_value   float,
+    spike_count      int,
+    profile_vector   VECTOR<FLOAT, 3>,
+    PRIMARY KEY ((location_id, sensor_type), sensor_id)
+)
+WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'sstable_size_in_mb': 160
+}
+AND comment = 'Latest rolling behavior profile per sensor. Partition groups peer sensors by room and type for ANN queries.';
+
+CREATE INDEX IF NOT EXISTS sensor_behavior_profiles_vector_idx
+ON sensor_behavior_profiles (profile_vector)
+USING 'sai';
 
 -- ============================================================
 -- Verification: list all tables per keyspace

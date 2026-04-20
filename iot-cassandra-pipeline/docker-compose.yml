@@ -1,8 +1,6 @@
 services:
   # ----------------------------------------------------------
   # Zookeeper — required by Kafka for broker coordination.
-  # Intentionally no healthcheck: the previous health-gated setup
-  # was causing false negatives during docker compose up -d.
   # ----------------------------------------------------------
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -18,8 +16,6 @@ services:
 
   # ----------------------------------------------------------
   # Kafka broker — message bus for the 3 sensor topic streams.
-  # Keep topic autocreation disabled and use kafka-init, but do
-  # not block startup on a fragile broker healthcheck.
   # ----------------------------------------------------------
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -55,27 +51,27 @@ services:
       - /bin/bash
       - -ec
       - |
-          set -o pipefail
-          echo '--- kafka-init starting ---'
-          echo '--- Waiting for Kafka broker ---'
-          cub kafka-ready -b kafka:29092 1 120
-          echo '--- Kafka is ready ---'
-          echo '--- Topics before creation ---'
-          kafka-topics --bootstrap-server kafka:29092 --list || true
-          echo '--- Creating Kafka topics ---'
-          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_temp_humidity --partitions 3 --replication-factor 1
-          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_light --partitions 3 --replication-factor 1
-          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_power --partitions 3 --replication-factor 1
-          echo '--- Topics after creation ---'
-          kafka-topics --bootstrap-server kafka:29092 --list
-          echo '--- kafka-init done ---'
+        set -o pipefail
+        echo '--- kafka-init starting ---'
+        echo '--- Waiting for Kafka broker ---'
+        cub kafka-ready -b kafka:29092 1 120
+        echo '--- Kafka is ready ---'
+        echo '--- Topics before creation ---'
+        kafka-topics --bootstrap-server kafka:29092 --list || true
+        echo '--- Creating Kafka topics ---'
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_temp_humidity --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_light --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic sensor_power --partitions 3 --replication-factor 1
+        echo '--- Topics after creation ---'
+        kafka-topics --bootstrap-server kafka:29092 --list
+        echo '--- kafka-init done ---'
     restart: "no"
 
-  # Manual CQL execution alternative to cassandra-init.
-  # docker exec -it cassandra-1 cqlsh -f /docker-entrypoint-initdb.d/init.cql
-
+  # ----------------------------------------------------------
+  # Cassandra schema init service.
+  # ----------------------------------------------------------
   cassandra-init:
-    image: cassandra:4.1
+    image: cassandra:5.0
     container_name: cassandra-init
     depends_on:
       cassandra-1:
@@ -99,11 +95,12 @@ services:
 
   # ----------------------------------------------------------
   # Cassandra Node 1 — seed node.
-  # Healthcheck uses nodetool UN, which is a much stronger
-  # readiness signal than cqlsh responding early.
+  # 
+  # Manual init.cql execution (if needed):
+  # docker exec -it cassandra-1 cqlsh -f /docker-entrypoint-initdb.d/init.cql
   # ----------------------------------------------------------
   cassandra-1:
-    image: cassandra:4.1
+    image: cassandra:5.0
     container_name: cassandra-1
     ports:
       - "9042:9042"
@@ -129,11 +126,10 @@ services:
       start_period: 90s
 
   # ----------------------------------------------------------
-  # Cassandra Node 2 — joins after node 1 is truly Up/Normal.
-  # Extra delay remains to reduce bootstrap overlap.
+  # Cassandra Node 2 — joins after node 1 is healthy.
   # ----------------------------------------------------------
   cassandra-2:
-    image: cassandra:4.1
+    image: cassandra:5.0
     container_name: cassandra-2
     command: /bin/bash -c "sleep 45 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
     depends_on:
@@ -160,11 +156,10 @@ services:
       start_period: 120s
 
   # ----------------------------------------------------------
-  # Cassandra Node 3 — wait longer and depend on the seed node
-  # being healthy, mirroring the older working strategy.
+  # Cassandra Node 3 — waits longer, same strategy as before.
   # ----------------------------------------------------------
   cassandra-3:
-    image: cassandra:4.1
+    image: cassandra:5.0
     container_name: cassandra-3
     command: /bin/bash -c "sleep 120 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
     depends_on:
@@ -189,50 +184,6 @@ services:
       timeout: 10s
       retries: 15
       start_period: 150s
-
-  # ----------------------------------------------------------
-  # Producer — run when ready.
-  # ----------------------------------------------------------
-  # producer:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.producer
-  #   container_name: producer
-  #   depends_on:
-  #     - kafka
-  #     kafka-init:
-  #       condition: service_completed_successfully
-  #   environment:
-  #     KAFKA_BROKER: kafka:29092
-  #   networks:
-  #     - iot-network
-  #   mem_limit: 256m
-  #   restart: on-failure
-
-  # ----------------------------------------------------------
-  # Spark Consumer — run when ready.
-  # ----------------------------------------------------------
-  # spark-consumer:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.spark
-  #   container_name: spark-consumer
-  #   depends_on:
-  #     - kafka
-  #     kafka-init:
-  #       condition: service_completed_successfully
-  #     cassandra-1:
-  #       condition: service_healthy
-  #   environment:
-  #     KAFKA_BROKER: kafka:29092
-  #     CASSANDRA_HOST: cassandra-1
-  #     CASSANDRA_PORT: "9042"
-  #   volumes:
-  #     - spark-checkpoints:/tmp/spark-checkpoints
-  #   networks:
-  #     - iot-network
-  #   mem_limit: 1500m
-  #   restart: on-failure
 
 volumes:
   cassandra-data-1:
