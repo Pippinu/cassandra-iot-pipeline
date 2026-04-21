@@ -337,6 +337,21 @@ While the query looks the same, the performance profile changes drastically. How
     
     Why: You did not provide a Partition Key. Even with an SAI, Cassandra must ask every node in the cluster to check its local SAI for temperatures > 25.
 
+### 3.6 Vector Search
+
+SAI is the engine of Vector Search in Cassandra 5.0 because it provides a modular "pluggable" framework that allows Cassandra to handle non-traditional data types (like high-dimensional vectors) without breaking its core storage engine.
+
+When you create an SAI on a vector column, it doesn't use a standard B-Tree. Instead, it uses JVector, an embedded vector search engine that implements a "close cousin" to the HNSW (Hierarchical Navigable Small World) algorithm.
+
+SAI "attaches" this graph structure directly to the SSTable. When you query for the "nearest neighbor," SAI navigates this graph to find the most similar vectors in milliseconds.
+
+| Feature | Scalar SAI (Text/Numeric) | Vector SAI (Vector Type) |
+| :--- | :--- | :--- |
+| **Data Structure** | Tries or k-d trees | **JVector / HNSW Graphs** |
+| **Query Logic** | Exact match or Range | **ANN (Approximate Nearest Neighbor)** |
+| **Math Engine** | Comparison operators | **Similarity Metrics** (Cosine/Dot Product) |
+| **Use Case** | `WHERE age > 20` | `ORDER BY vector ANN OF [...]` |
+
 ---
 
 ## 4. LSM-Tree Storage Engine
