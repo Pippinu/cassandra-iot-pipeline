@@ -25,17 +25,21 @@ com.datastax.spark:spark-cassandra-connector_2.12:3.5.1 \
 import os
 import uuid as uuid_lib
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql.functions import (
     avg,
     col,
     concat_ws,
     count,
+    current_date,
+    date_sub,
+    desc,
     from_json,
     from_unixtime,
     lit,
     max,
     min,
+    row_number,
     sqrt,
     sum as spark_sum,
     to_date,
@@ -142,6 +146,7 @@ spark.sparkContext.setLogLevel("ERROR")
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def read_topic(topic: str) -> DataFrame:
     return (
         spark.readStream.format("kafka")
@@ -153,14 +158,13 @@ def read_topic(topic: str) -> DataFrame:
         .selectExpr("CAST(value AS STRING) AS json_str")
     )
 
+
 def add_time_columns(df: DataFrame) -> DataFrame:
-    return (
-        df.withColumn(
-            "timestamp",
-            from_unixtime(col("timestamp") / 1000).cast(TimestampType()),
-        )
-        .withColumn("date", to_date(col("timestamp")))
-    )
+    return df.withColumn(
+        "timestamp",
+        from_unixtime(col("timestamp") / 1000).cast(TimestampType()),
+    ).withColumn("date", to_date(col("timestamp")))
+
 
 def cassandra_sink(df: DataFrame, keyspace: str, table: str, suffix: str):
     return (
@@ -170,6 +174,7 @@ def cassandra_sink(df: DataFrame, keyspace: str, table: str, suffix: str):
         .outputMode("append")
         .start()
     )
+
 
 gen_uuid = udf(lambda: str(uuid_lib.uuid4()), StringType())
 
@@ -231,7 +236,13 @@ q2 = cassandra_sink(
 
 q3 = cassandra_sink(
     raw_power_enriched.select(
-        "sensor_id", "date", "timestamp", "location_id", "voltage", "amperage", "wattage"
+        "sensor_id",
+        "date",
+        "timestamp",
+        "location_id",
+        "voltage",
+        "amperage",
+        "wattage",
     ),
     KS_RAW,
     "power_by_sensor",
@@ -288,23 +299,29 @@ q4c = cassandra_sink(
 
 metadata_stream = (
     raw_th.select("sensor_id", "sensor_type", "location_id", "description")
-    .unionByName(raw_light.select("sensor_id", "sensor_type", "location_id", "description"))
-    .unionByName(raw_power_enriched.select("sensor_id", "sensor_type", "location_id", "description"))
+    .unionByName(
+        raw_light.select("sensor_id", "sensor_type", "location_id", "description")
+    )
+    .unionByName(
+        raw_power_enriched.select(
+            "sensor_id", "sensor_type", "location_id", "description"
+        )
+    )
 )
+
 
 def write_metadata_batch(batch_df, batch_id):
     if batch_df.isEmpty():
         return
 
-    metadata_df = (
-        batch_df.select("sensor_id", "sensor_type", "location_id", "description")
-        .dropDuplicates(["sensor_id"])
-    )
+    metadata_df = batch_df.select(
+        "sensor_id", "sensor_type", "location_id", "description"
+    ).dropDuplicates(["sensor_id"])
 
-    metadata_df.write.format("org.apache.spark.sql.cassandra") \
-        .options(table="devices_metadata", keyspace=KS_RAW) \
-        .mode("append") \
-        .save()
+    metadata_df.write.format("org.apache.spark.sql.cassandra").options(
+        table="devices_metadata", keyspace=KS_RAW
+    ).mode("append").save()
+
 
 q5 = (
     metadata_stream.writeStream.foreachBatch(write_metadata_batch)
@@ -316,6 +333,7 @@ q5 = (
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_analytics — sensor_aggregates_30s
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def build_sensor_aggregates(df: DataFrame, metric_col: str) -> DataFrame:
     return (
@@ -345,6 +363,7 @@ def build_sensor_aggregates(df: DataFrame, metric_col: str) -> DataFrame:
         )
     )
 
+
 q6 = cassandra_sink(
     build_sensor_aggregates(raw_th, "temperature"),
     KS_ANALYTICS,
@@ -370,6 +389,7 @@ q8 = cassandra_sink(
 # iot_analytics — aggregates_by_type
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def build_type_aggregates(df: DataFrame, metric_col: str) -> DataFrame:
     return (
         df.withWatermark("timestamp", "1 minute")
@@ -389,6 +409,7 @@ def build_type_aggregates(df: DataFrame, metric_col: str) -> DataFrame:
             col("avg_value"),
         )
     )
+
 
 q9 = cassandra_sink(
     build_type_aggregates(raw_th, "temperature"),
@@ -414,6 +435,8 @@ q11 = cassandra_sink(
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_alerts — sensor_alerts
 # ──────────────────────────────────────────────────────────────────────────────
+
+UUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 
 def detect_alerts(df: DataFrame) -> DataFrame:
     return (
@@ -449,7 +472,7 @@ def detect_alerts(df: DataFrame) -> DataFrame:
                 & (col("amperage") > THRESHOLDS["amperage_high"]),
                 lit("AMPERAGE_HIGH"),
             )
-            .otherwise(None)
+            .otherwise(None),
         )
         .filter(col("alert_type").isNotNull())
         .withColumn("alert_id", gen_uuid())
@@ -483,16 +506,25 @@ def detect_alerts(df: DataFrame) -> DataFrame:
         )
     )
 
-def write_alerts_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
+
+def gen_uuid_str():
+    return str(uuid_lib.uuid4())
+
+gen_uuid = udf(gen_uuid_str, StringType())
+
+def write_alerts_batch(batchdf, batchid):
+    if batchdf.isEmpty():
         return
 
-    alerts = detect_alerts(batch_df)
-    if not alerts.isEmpty():
-        alerts.write.format("org.apache.spark.sql.cassandra") \
-            .options(table="sensor_alerts", keyspace=KS_ALERTS) \
-            .mode("append") \
-            .save()
+    alerts = detect_alerts(batchdf).filter(col("alert_id").rlike(UUID_RE))
+    if alerts.isEmpty():
+        return
+
+    alerts.write.format("org.apache.spark.sql.cassandra") \
+        .options(table="sensor_alerts", keyspace=KS_ALERTS) \
+        .mode("append") \
+        .save()
+
 
 th_for_alerts = (
     raw_th.withColumn("light_level", lit(None).cast(FloatType()))
@@ -564,46 +596,167 @@ q12 = (
 # profile_vector = [mean_value, variance_value, spike_count]
 # ──────────────────────────────────────────────────────────────────────────────
 
-profile_th = raw_th.select(
-    "sensor_id",
-    "sensor_type",
-    "location_id",
-    "timestamp",
-    col("humidity").alias("profile_value"),
-    lit(float(PROFILE_SPIKE_THRESHOLDS["temp_humidity"])).alias("spike_threshold"),
-)
+# profile_th = raw_th.select(
+#     "sensor_id",
+#     "sensor_type",
+#     "location_id",
+#     "timestamp",
+#     col("humidity").alias("profile_value"),
+#     lit(float(PROFILE_SPIKE_THRESHOLDS["temp_humidity"])).alias("spike_threshold"),
+# )
 
-profile_light = raw_light.select(
-    "sensor_id",
-    "sensor_type",
-    "location_id",
-    "timestamp",
-    col("light_level").alias("profile_value"),
-    lit(float(PROFILE_SPIKE_THRESHOLDS["light"])).alias("spike_threshold"),
-)
+# profile_light = raw_light.select(
+#     "sensor_id",
+#     "sensor_type",
+#     "location_id",
+#     "timestamp",
+#     col("light_level").alias("profile_value"),
+#     lit(float(PROFILE_SPIKE_THRESHOLDS["light"])).alias("spike_threshold"),
+# )
 
-profile_power = raw_power_enriched.select(
-    "sensor_id",
-    "sensor_type",
-    "location_id",
-    "timestamp",
-    col("wattage").alias("profile_value"),
-    lit(float(PROFILE_SPIKE_THRESHOLDS["power"])).alias("spike_threshold"),
-)
+# profile_power = raw_power_enriched.select(
+#     "sensor_id",
+#     "sensor_type",
+#     "location_id",
+#     "timestamp",
+#     col("wattage").alias("profile_value"),
+#     lit(float(PROFILE_SPIKE_THRESHOLDS["power"])).alias("spike_threshold"),
+# )
 
-profile_stream = (
-    profile_th
-    .unionByName(profile_light)
-    .unionByName(profile_power)
-)
+# profile_stream = (
+#     profile_th
+#     .unionByName(profile_light)
+#     .unionByName(profile_power)
+# )
 
-def write_behavior_profiles_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
+# def write_behavior_profiles_batch(batch_df, batch_id):
+#     if batch_df.isEmpty():
+#         return
+
+#     profiles = (
+#         batch_df.filter(col("profile_value").isNotNull())
+#         .groupBy("location_id", "sensor_type", "sensor_id")
+#         .agg(
+#             max("timestamp").alias("last_updated_at"),
+#             count("*").cast("int").alias("profile_size"),
+#             avg("profile_value").alias("mean_value"),
+#             avg(col("profile_value") * col("profile_value")).alias("mean_square"),
+#             spark_sum(
+#                 when(col("profile_value") > col("spike_threshold"), lit(1)).otherwise(lit(0))
+#             ).cast("int").alias("spike_count"),
+#         )
+#         .withColumn(
+#             "variance_value",
+#             when(
+#                 col("mean_square") - col("mean_value") * col("mean_value") < 0,
+#                 lit(0.0),
+#             ).otherwise(col("mean_square") - col("mean_value") * col("mean_value")),
+#         )
+#         .withColumn(
+#             "profile_vector",
+#             vector_udf(col("mean_value"), col("variance_value"), col("spike_count"))
+#         )
+#         .select(
+#             "location_id",
+#             "sensor_type",
+#             "sensor_id",
+#             "last_updated_at",
+#             "profile_size",
+#             col("mean_value").cast("float").alias("mean_value"),
+#             col("variance_value").cast("float").alias("variance_value"),
+#             "spike_count",
+#             "profile_vector",
+#         )
+#     )
+
+#     if profiles.isEmpty():
+#         return
+
+#     profiles.write.format("org.apache.spark.sql.cassandra") \
+#         .options(table="sensor_behavior_profiles", keyspace=KS_ANALYTICS) \
+#         .mode("append") \
+#         .save()
+
+# q13 = (
+#     profile_stream.writeStream.foreachBatch(write_behavior_profiles_batch)
+#     .option("checkpointLocation", f"{CHECKPOINT_DIR}/behavior_profiles")
+#     .outputMode("append")
+#     .start()
+# )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+
+PROFILE_SIZE = 200
+PROFILE_LOOKBACK_DAYS = 1  # include today + possible rollover from yesterday
+
+def recent_profile_source() -> DataFrame:
+    th = (
+        spark.read.format("org.apache.spark.sql.cassandra")
+        .options(table="temp_humidity_by_sensor", keyspace=KS_RAW)
+        .load()
+        .filter(col("date") >= date_sub(current_date(), PROFILE_LOOKBACK_DAYS))
+        .select(
+            col("sensor_id"),
+            lit("temp_humidity").alias("sensor_type"),
+            col("location_id"),
+            col("timestamp"),
+            col("humidity").alias("profile_value"),
+            lit(float(PROFILE_SPIKE_THRESHOLDS["temp_humidity"])).alias("spike_threshold"),
+        )
+    )
+
+    light = (
+        spark.read.format("org.apache.spark.sql.cassandra")
+        .options(table="light_by_sensor", keyspace=KS_RAW)
+        .load()
+        .filter(col("date") >= date_sub(current_date(), PROFILE_LOOKBACK_DAYS))
+        .select(
+            col("sensor_id"),
+            lit("light").alias("sensor_type"),
+            col("location_id"),
+            col("timestamp"),
+            col("light_level").alias("profile_value"),
+            lit(float(PROFILE_SPIKE_THRESHOLDS["light"])).alias("spike_threshold"),
+        )
+    )
+
+    power = (
+        spark.read.format("org.apache.spark.sql.cassandra")
+        .options(table="power_by_sensor", keyspace=KS_RAW)
+        .load()
+        .filter(col("date") >= date_sub(current_date(), PROFILE_LOOKBACK_DAYS))
+        .select(
+            col("sensor_id"),
+            lit("power").alias("sensor_type"),
+            col("location_id"),
+            col("timestamp"),
+            col("wattage").alias("profile_value"),
+            lit(float(PROFILE_SPIKE_THRESHOLDS["power"])).alias("spike_threshold"),
+        )
+    )
+
+    return (
+        th.unionByName(light)
+        .unionByName(power)
+        .filter(col("profile_value").isNotNull())
+    )
+
+def refresh_behavior_profiles(batch_df: DataFrame, batch_id: int) -> None:
+    source = recent_profile_source()
+
+    rank_window = Window.partitionBy(
+        "location_id", "sensor_type", "sensor_id"
+    ).orderBy(desc("timestamp"))
+
+    recent_n = (
+        source.withColumn("rn", row_number().over(rank_window))
+        .filter(col("rn") <= PROFILE_SIZE)
+        .drop("rn")
+    )
 
     profiles = (
-        batch_df.filter(col("profile_value").isNotNull())
-        .groupBy("location_id", "sensor_type", "sensor_id")
+        recent_n.groupBy("location_id", "sensor_type", "sensor_id")
         .agg(
             max("timestamp").alias("last_updated_at"),
             count("*").cast("int").alias("profile_size"),
@@ -620,9 +773,14 @@ def write_behavior_profiles_batch(batch_df, batch_id):
                 lit(0.0),
             ).otherwise(col("mean_square") - col("mean_value") * col("mean_value")),
         )
+        .filter(col("profile_size") >= 10)
         .withColumn(
             "profile_vector",
-            vector_udf(col("mean_value"), col("variance_value"), col("spike_count"))
+            vector_udf(
+                col("mean_value"),
+                col("variance_value"),
+                col("spike_count"),
+            ),
         )
         .select(
             "location_id",
@@ -645,9 +803,13 @@ def write_behavior_profiles_batch(batch_df, batch_id):
         .mode("append") \
         .save()
 
+# lightweight trigger stream: recompute profiles every 30s from Cassandra history
+profile_tick = spark.readStream.format("rate").option("rowsPerSecond", 1).load()
+
 q13 = (
-    profile_stream.writeStream.foreachBatch(write_behavior_profiles_batch)
-    .option("checkpointLocation", f"{CHECKPOINT_DIR}/behavior_profiles")
+    profile_tick.writeStream.foreachBatch(refresh_behavior_profiles)
+    .trigger(processingTime="30 seconds")
+    .option("checkpointLocation", f"{CHECKPOINT_DIR}/behavior_profiles_refresh")
     .outputMode("append")
     .start()
 )
