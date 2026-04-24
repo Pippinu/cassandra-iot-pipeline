@@ -216,6 +216,7 @@ raw_power_enriched = raw_power.withColumn("wattage", col("voltage") * col("amper
 
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_raw — typed raw tables
+# Sensor-centric denormalized tables for efficient retrieval of recent readings by sensor_id
 # ──────────────────────────────────────────────────────────────────────────────
 
 q1 = cassandra_sink(
@@ -251,6 +252,8 @@ q3 = cassandra_sink(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_raw — readings_by_location
+# 
+# Unified readings_by_location table for efficient retrieval of recent readings by location_id
 # ──────────────────────────────────────────────────────────────────────────────
 
 q4a = cassandra_sink(
@@ -295,6 +298,7 @@ q4c = cassandra_sink(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_raw — devices_metadata
+# Devices metadata table with one record per sensor, updated from incoming streams
 # ──────────────────────────────────────────────────────────────────────────────
 
 metadata_stream = (
@@ -332,6 +336,7 @@ q5 = (
 
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_analytics — sensor_aggregates_30s
+# 30-second tumbling window aggregates by sensor_id for each metric, with event-time watermarking
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -387,6 +392,7 @@ q8 = cassandra_sink(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_analytics — aggregates_by_type
+# 30-second tumbling window aggregates by sensor_type for each metric, with event-time watermarking
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -434,6 +440,7 @@ q11 = cassandra_sink(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_alerts — sensor_alerts
+# Detect threshold breaches in incoming readings and generate alerts with severity levels
 # ──────────────────────────────────────────────────────────────────────────────
 
 UUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -589,102 +596,13 @@ q12 = (
 
 # ──────────────────────────────────────────────────────────────────────────────
 # iot_analytics — sensor_behavior_profiles
-# Safer Path A: compute one profile per sensor from each micro-batch
+# Compute one profile per sensor from recent historical data (200) in Cassandra, 
+# updated every 30 seconds with foreachBatch, for use in vector search
+# 
 # temp_humidity -> humidity
 # light         -> light_level
 # power         -> wattage
 # profile_vector = [mean_value, variance_value, spike_count]
-# ──────────────────────────────────────────────────────────────────────────────
-
-# profile_th = raw_th.select(
-#     "sensor_id",
-#     "sensor_type",
-#     "location_id",
-#     "timestamp",
-#     col("humidity").alias("profile_value"),
-#     lit(float(PROFILE_SPIKE_THRESHOLDS["temp_humidity"])).alias("spike_threshold"),
-# )
-
-# profile_light = raw_light.select(
-#     "sensor_id",
-#     "sensor_type",
-#     "location_id",
-#     "timestamp",
-#     col("light_level").alias("profile_value"),
-#     lit(float(PROFILE_SPIKE_THRESHOLDS["light"])).alias("spike_threshold"),
-# )
-
-# profile_power = raw_power_enriched.select(
-#     "sensor_id",
-#     "sensor_type",
-#     "location_id",
-#     "timestamp",
-#     col("wattage").alias("profile_value"),
-#     lit(float(PROFILE_SPIKE_THRESHOLDS["power"])).alias("spike_threshold"),
-# )
-
-# profile_stream = (
-#     profile_th
-#     .unionByName(profile_light)
-#     .unionByName(profile_power)
-# )
-
-# def write_behavior_profiles_batch(batch_df, batch_id):
-#     if batch_df.isEmpty():
-#         return
-
-#     profiles = (
-#         batch_df.filter(col("profile_value").isNotNull())
-#         .groupBy("location_id", "sensor_type", "sensor_id")
-#         .agg(
-#             max("timestamp").alias("last_updated_at"),
-#             count("*").cast("int").alias("profile_size"),
-#             avg("profile_value").alias("mean_value"),
-#             avg(col("profile_value") * col("profile_value")).alias("mean_square"),
-#             spark_sum(
-#                 when(col("profile_value") > col("spike_threshold"), lit(1)).otherwise(lit(0))
-#             ).cast("int").alias("spike_count"),
-#         )
-#         .withColumn(
-#             "variance_value",
-#             when(
-#                 col("mean_square") - col("mean_value") * col("mean_value") < 0,
-#                 lit(0.0),
-#             ).otherwise(col("mean_square") - col("mean_value") * col("mean_value")),
-#         )
-#         .withColumn(
-#             "profile_vector",
-#             vector_udf(col("mean_value"), col("variance_value"), col("spike_count"))
-#         )
-#         .select(
-#             "location_id",
-#             "sensor_type",
-#             "sensor_id",
-#             "last_updated_at",
-#             "profile_size",
-#             col("mean_value").cast("float").alias("mean_value"),
-#             col("variance_value").cast("float").alias("variance_value"),
-#             "spike_count",
-#             "profile_vector",
-#         )
-#     )
-
-#     if profiles.isEmpty():
-#         return
-
-#     profiles.write.format("org.apache.spark.sql.cassandra") \
-#         .options(table="sensor_behavior_profiles", keyspace=KS_ANALYTICS) \
-#         .mode("append") \
-#         .save()
-
-# q13 = (
-#     profile_stream.writeStream.foreachBatch(write_behavior_profiles_batch)
-#     .option("checkpointLocation", f"{CHECKPOINT_DIR}/behavior_profiles")
-#     .outputMode("append")
-#     .start()
-# )
-
-# ──────────────────────────────────────────────────────────────────────────────
 # ──────────────────────────────────────────────────────────────────────────────
 
 PROFILE_SIZE = 200
@@ -742,6 +660,8 @@ def recent_profile_source() -> DataFrame:
         .filter(col("profile_value").isNotNull())
     )
 
+# This function will be called every 30 seconds.
+# We read recent historical data from Cassandra, compute profiles for each sensor, and write the updated profiles back to Cassandra.
 def refresh_behavior_profiles(batch_df: DataFrame, batch_id: int) -> None:
     source = recent_profile_source()
 
@@ -816,6 +736,7 @@ q13 = (
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Keep alive
+# We have 13 streaming queries running concurrently, and we want to keep the application alive until we manually stop it.
 # ──────────────────────────────────────────────────────────────────────────────
 
 active_count = len(spark.streams.active)

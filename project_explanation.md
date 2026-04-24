@@ -1,3 +1,397 @@
+# IoT project explanation source for NotebookLM
+
+This note explains the Cassandra-based IoT project used as the case study for the presentation.
+
+It is intended to serve as the **factual project source** for the slide deck.  
+The presentation focuses on Cassandra, but the project is the concrete environment that proves the database design choices.
+
+---
+
+## 1. Project objective
+
+The project is an IoT streaming pipeline built to ingest sensor events in real time, process them with Spark Structured Streaming, and persist multiple views of the data in Apache Cassandra.
+
+The project is not just a generic data pipeline.  
+It is specifically designed to show how Cassandra can support:
+
+- high-throughput raw ingestion,
+- denormalized query-oriented schema design,
+- room-based and sensor-based query patterns,
+- alert persistence,
+- windowed analytics,
+- and a Cassandra 5 extension toward vector similarity search.
+
+The overall presentation goal is therefore to use this project as evidence that Cassandra’s architecture and modeling principles are directly applicable to an IoT analytics workload.
+
+---
+
+## 2. High-level architecture
+
+The project is composed of four main layers:
+
+1. **Kafka producer**
+2. **Kafka broker**
+3. **Spark Structured Streaming consumer**
+4. **Cassandra cluster**
+
+The data flow is:
+
+**Producer -> Kafka topics -> Spark Structured Streaming -> Cassandra**
+
+The producer emits sensor events continuously.  
+Spark consumes the events from Kafka, parses the JSON payloads, enriches and transforms the data, computes alerts and analytics, and writes the results into Cassandra tables.
+
+---
+
+## 3. Deployment environment
+
+The stack is deployed with Docker Compose.
+
+The main infrastructure components are:
+
+- ZooKeeper
+- Kafka
+- Kafka topic initialization container
+- Cassandra schema initialization container
+- Cassandra node 1
+- Cassandra node 2
+- Cassandra node 3
+
+The Cassandra deployment is a **3-node Cassandra 5 cluster**.  
+The cluster uses:
+- cluster name `IoT-Cluster`,
+- datacenter `dc1`,
+- `GossipingPropertyFileSnitch`,
+- and Cassandra 5 images for all three nodes.
+
+Kafka topics are created explicitly by the initialization container rather than relying on auto-created topics.
+
+---
+
+## 4. Kafka topics and sensor streams
+
+The producer side of the project generates **three sensor streams**, each represented by a dedicated Kafka topic:
+
+- `sensor_temp_humidity`
+- `sensor_light`
+- `sensor_power`
+
+These correspond to three sensor families:
+
+1. temperature/humidity sensors,
+2. light sensors,
+3. power sensors.
+
+The Spark consumer reads these three topics separately and parses them into three structured streams.
+
+---
+
+## 5. Spark consumer role
+
+The Spark application is the central processing layer of the system.
+
+Its responsibilities include:
+
+- reading the three Kafka topics,
+- parsing JSON sensor events,
+- converting timestamps,
+- deriving a `date` column for partition-bounded tables,
+- enriching power readings with computed `wattage`,
+- writing raw streams into Cassandra,
+- building windowed aggregates,
+- generating threshold-based alerts,
+- and writing simplified behavior profiles for vector search.
+
+In the Cassandra schema, the keyspaces are:
+
+- `iot_raw`
+- `iot_analytics`
+- `iot_alerts`
+
+For presentation purposes, these should be described as the same three logical areas:
+- raw ingestion,
+- analytics,
+- alerts.
+
+---
+
+## 6. Cassandra cluster and replication design
+
+The Cassandra schema defines three keyspaces:
+
+- `iot_raw`
+- `iot_alerts`
+- `iot_analytics`
+
+Each keyspace uses:
+
+- `NetworkTopologyStrategy`
+- datacenter `dc1`
+- replication factor `2`.
+
+This means each partition is replicated on **2 of the 3 Cassandra nodes**, which is a useful concrete example for explaining replication, fault tolerance, and tunable consistency in the presentation.
+
+---
+
+## 7. Raw ingestion data model
+
+The `iot_raw` keyspace stores the operational sensor data and metadata.
+
+### 7.1 `devices_metadata`
+This table stores static reference information about sensors:
+- sensor_ID,
+- sensor_type,
+- location_ID,
+- and description.
+
+Its purpose is to answer metadata lookups for a sensor.
+
+### 7.2 `temp_humidity_by_sensor`
+This table stores raw temperature and humidity events for a single sensor over time.
+
+Its key design uses:
+- sensor_ID,
+- date bucket,
+- timestamp as clustering order.
+
+This supports the query pattern:
+- “give me the latest readings for this temperature/humidity sensor on this day.”
+
+### 7.3 `light_by_sensor`
+This table stores raw light readings per sensor with the same time-bucket pattern.
+
+### 7.4 `power_by_sensor`
+This table stores raw electrical readings per sensor:
+- amperage,
+- voltage,
+- and derived wattage.
+
+`wattage` is not part of the original Kafka message; it is computed inside Spark as:
+- voltage × amperage.
+
+These raw tables are write-heavy and use `SizeTieredCompactionStrategy`, which matches their ingestion-oriented workload.
+
+---
+
+## 8. Location-centric wide table
+
+One of the most important raw tables is:
+
+- `readings_by_location`.
+
+This table reorganizes sensor data by:
+- location,
+- date,
+- timestamp,
+- sensor ID.
+
+Its purpose is to answer queries such as:
+- “show all readings in room X on date D.”
+
+This table is intentionally **sparse**:
+- temperature/humidity rows only populate temperature and humidity columns,
+- light rows only populate the light column,
+- power rows only populate amperage, voltage, and wattage columns.
+
+The Cassandra schema comments explicitly describe this as an intentional demonstration of Cassandra’s storage model: irrelevant columns are absent rather than stored as fixed-width nulls, which makes the table a good example of wide-column and sparse-row design.
+
+This table is very important for the presentation because it shows a specifically Cassandra-oriented way of thinking about data layout.
+
+---
+
+## 9. Metadata and denormalization logic
+
+The project does not try to normalize everything into a small number of generic tables.
+
+Instead, it follows a query-oriented pattern:
+- per-sensor raw tables,
+- location-centric table,
+- metadata table,
+- alerts table,
+- analytics tables,
+- and vector-profile table.
+
+This makes the project a strong example of Cassandra’s query-first modeling philosophy:
+the same domain is represented through multiple tables shaped for different access paths.
+
+---
+
+## 10. Alert pipeline
+
+The Spark consumer defines threshold-based alert logic.
+
+Alerts are triggered for conditions such as:
+- high temperature,
+- low temperature,
+- high humidity,
+- high light level,
+- high voltage,
+- high amperage.
+
+Spark generates:
+- `alert_id`,
+- severity,
+- message text,
+- and the event timestamp,
+then writes alerts into the Cassandra alerts table.
+
+The Cassandra alerts table is:
+
+- `iot_alerts.sensor_alerts`.
+
+Its key design groups alerts by sensor and orders them by timestamp descending, with `alert_id` included to avoid collisions when more than one alert occurs at nearly the same time.
+
+This table is a clean example of a read-oriented Cassandra table designed around the query:
+- “show recent alerts for sensor X.”
+
+---
+
+## 11. Analytics tables
+
+The `iot_analytics` keyspace stores derived analytical views.
+
+### 11.1 `sensor_aggregates_30s`
+This table contains 30-second window aggregates per sensor:
+- average value,
+- minimum,
+- maximum,
+- reading count.
+
+It mirrors the raw-table partitioning pattern by using sensor and date as the partition dimension.
+
+### 11.2 `aggregates_by_type`
+This table groups sensor data by sensor type and date, enabling cross-sensor comparisons for the same family of sensors.
+
+This supports queries like:
+- “how are all sensors of this type behaving today?”
+
+Together, these analytics tables show how Spark creates derived materialized views tailored to specific read patterns in Cassandra.
+
+---
+
+## 12. Vector-search-oriented table
+
+The Cassandra schema also contains:
+
+- `sensor_behavior_profiles` in `iot_analytics`.
+
+This table is intended for Cassandra 5 vector search.
+
+Its columns include:
+- location_ID,
+- sensor_type,
+- sensor_ID,
+- last_update_timestamp,
+- profile_size,
+- mean_value,
+- variance_value,
+- spike_count,
+- and `profile_vector VECTOR<FLOAT, 3>`.
+
+The table is partitioned by:
+- `location_id`,
+- `sensor_type`.
+
+This is an important modeling decision because ANN search should compare only **peer sensors**:
+- in the same room,
+- and of the same sensor family.
+
+The schema also defines an SAI index on the vector column.
+
+This table is central to the advanced Cassandra 5 part of the presentation.
+
+---
+
+## 13. Current implementation status of behavior profiles
+
+The current Spark consumer includes a simplified `foreachBatch` path for populating `sensor_behavior_profiles`.
+
+This is important context for the presentation:
+the current stable version avoids the previous stateful Pandas path and instead computes behavior-profile features inside a simpler batch callback.
+
+The features currently written are based on:
+- `mean_value`,
+- `variance_value`,
+- `spike_count`,
+which are then assembled into a 3-dimensional vector.
+
+For presentation purposes, this should be described carefully:
+the project already demonstrates Cassandra’s ability to store vectors and perform ANN-style lookups, while the logic used to build those vectors can be improved independently of Cassandra itself.
+
+That distinction matters:
+- vector search requires stored vectors and ANN querying support,
+- not a specific Spark state mechanism.
+
+---
+
+## 14. Why the project is a good Cassandra case study
+
+This project is a good Cassandra case study because it naturally exhibits several Cassandra strengths.
+
+### 14.1 Heavy continuous ingestion
+Sensor events arrive continuously, which aligns well with Cassandra’s write-optimized architecture.
+
+### 14.2 Query-oriented denormalization
+The same domain is stored in multiple tables, each shaped for a concrete query pattern.
+
+### 14.3 Time-bucketed partitioning
+Raw sensor tables partition by sensor and date, which bounds partition size and keeps recency-oriented queries practical.
+
+### 14.4 Room-centric analytics
+The location-based table demonstrates how Cassandra can support alternate query dimensions without joins.
+
+### 14.5 Alert persistence
+The alert table is a strong example of a narrow, query-specific read path.
+
+### 14.6 Derived analytics
+Windowed aggregates show how Spark and Cassandra combine naturally: Spark computes, Cassandra persists denormalized outputs.
+
+### 14.7 Advanced Cassandra 5 feature
+The vector-profile table extends the model from classic operational analytics toward similarity search.
+
+---
+
+## 15. Suggested presentation story
+
+The presentation should use the project as evidence, not as a distraction from Cassandra.
+
+A good narrative is:
+
+1. Explain Cassandra fundamentals first.
+2. Show how partitioning, denormalization, and write-optimized storage influence schema design.
+3. Introduce the IoT pipeline as the practical environment.
+4. Use real tables to show query-first modeling.
+5. Show how alerts and analytics become natural Cassandra read models.
+6. End with Cassandra 5 vector search as a modern extension of the same data model.
+
+The project should therefore appear as:
+- a concrete proof of Cassandra concepts,
+- not merely as a list of implementation details.
+
+---
+
+## 16. Key project facts to preserve
+
+When generating slides or notes, preserve these facts:
+
+- The project uses **Kafka + Spark Structured Streaming + Cassandra**.
+- Kafka contains **three sensor topics**: `sensor_temp_humidity`, `sensor_light`, `sensor_power`.
+- Cassandra is deployed as a **3-node Cassandra 5 cluster**.
+- The schema defines three keyspaces: `iot_raw`, `iot_alerts`, `iot_analytics`.
+- Keyspaces use `NetworkTopologyStrategy` with replication factor 2 in `dc1`.
+- Raw tables include `temp_humidity_by_sensor`, `light_by_sensor`, `power_by_sensor`, `readings_by_location`, and `devices_metadata`.
+- Alerts are stored in `sensor_alerts`.
+- Analytics tables include `sensor_aggregates_30s` and `aggregates_by_type`.
+- The vector-search-oriented table is `sensor_behavior_profiles` with `profile_vector VECTOR<FLOAT, 3>` and an SAI index.
+- Spark computes `wattage` from voltage and amperage before persisting power readings.
+
+These are the core facts that should remain stable across the deck.
+
+## 17 init.cql
+
+Here is the whole cassandra init.cql file that explains the cassandra schema
+
+```sql
 -- ============================================================
 -- IoT Sensor Pipeline — Cassandra Schema
 -- Cluster:  3 nodes, RF=2, NetworkTopologyStrategy
@@ -213,7 +607,9 @@ AND comment = 'Threshold alerts from Spark. alert_id prevents millisecond-collis
 
 -- SIA index, create it in live:
 
--- CREATE CUSTOM INDEX IF NOT EXISTS sensor_alerts_location_sai ON iot_alerts.sensor_alerts (location_id) USING 'StorageAttachedIndex';
+-- CREATE CUSTOM INDEX IF NOT EXISTS sensor_alerts_location_sai
+-- ON iot_alerts.sensor_alerts (location_id)
+-- USING 'StorageAttachedIndex';
 
 -- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
@@ -331,3 +727,4 @@ USING 'sai';
 SELECT keyspace_name, table_name
 FROM system_schema.tables
 WHERE keyspace_name IN ('iot_raw', 'iot_alerts', 'iot_analytics');
+```

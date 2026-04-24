@@ -56,8 +56,7 @@ ROOMS = ["room_A", "room_B", "room_C"]
 SENSORS_PER_TYPE_PER_ROOM = 10  # 10 × 3 rooms × 3 types = 90 total sensors
 
 # ============================================================
-# Thresholds
-# Must stay aligned with spark_consumer.py
+# Thresholds, aligned with spark_consumer.py
 # ============================================================
 
 THRESHOLDS = {
