@@ -61,10 +61,20 @@ Modern Cassandra uses **virtual nodes (vNodes)**: each physical node is assigned
 - **Uniform data distribution** across nodes
 - **Faster rebalancing** when a node is added or removed (many small chunks move instead of one large one)
 - **Better fault tolerance** (a failing node's load spreads across all remaining nodes, not just its immediate neighbors)
+- **Virtual Node (vNode) Awareness**: The coordinator deliberately **skips vNodes located on the same physical hardware**. 
+  - This ensures that a single hardware failure cannot take down multiple copies of the same data.
 
 #### Replication
 
-With a Replication Factor of RF=3, Cassandra hashes the partition key to its primary owner, then scans clockwise to find 2 additional vNodes on **different physical machines** to store replicas. It deliberately skips vNodes on the same physical machine to ensure a single hardware failure cannot take down multiple replicas.
+With a Replication Factor of RF=3, Cassandra hashes the partition key to its primary owner, then scans clockwise to find 2 additional vNodes on **different physical machines** to store replicas. 
+- In this project, i use RF=2 given that we have just 2 nodes.
+
+**Strategy Comparison:**
+* ***SimpleStrategy***: Replicas are placed strictly in a clockwise fashion around the ring. 
+  * It is best suited for single-datacenter or development clusters where rack awareness is not a priority.
+
+* ***NetworkTopologyStrategy***: It allows for Datacenter and Rack awareness, ensuring that replicas are distributed across different physical racks to protect against power or networking failures in a specific area of the data center.
+  * This is the production standard.
 
 ---
 

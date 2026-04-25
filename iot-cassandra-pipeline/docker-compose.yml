@@ -185,12 +185,43 @@ services:
       retries: 15
       start_period: 150s
 
+  cassandra-4:
+    image: cassandra:5.0
+    container_name: cassandra-4
+    profiles: ["scaleout"]
+    command: /bin/bash -c "sleep 30 && /usr/local/bin/docker-entrypoint.sh cassandra -f"
+    depends_on:
+      cassandra-1:
+        condition: service_healthy
+    environment:
+      CASSANDRA_CLUSTER_NAME: IoT-Cluster
+      CASSANDRA_DC: dc1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_SEEDS: cassandra-1
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 200M
+    mem_limit: 1500m
+    volumes:
+      - cassandra-data-4:/var/lib/cassandra
+    networks:
+      - iot-network
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status | grep -q UN"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 150s
+
 volumes:
   cassandra-data-1:
   cassandra-data-2:
   cassandra-data-3:
+  cassandra-data-4:
   kafka-data:
   spark-checkpoints:
+
+
 
 networks:
   iot-network:
