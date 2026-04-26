@@ -1,3 +1,4 @@
 iot-cassandra-pipeline/presentation/*
 iot-cassandra-pipeline/schemas/*
 iot-cassandra-pipeline/monitoring/*
+iot-cassandra-pipeline/monitoring/cassandra_auto_flush.sh
