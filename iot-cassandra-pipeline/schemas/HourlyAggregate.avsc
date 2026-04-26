@@ -1,0 +1,38 @@
+{
+  "type": "record",
+  "name": "HourlyAggregate",
+  "namespace": "com.iot.pipeline",
+  "doc": "Pre-computed hourly aggregates per device, written by Spark",
+  "fields": [
+    {
+      "name": "device_id",
+      "type": "string",
+      "doc": "UUID of the device as a string"
+    },
+    {
+      "name": "hour_bucket",
+      "type": "long",
+      "doc": "Unix epoch seconds of the start of the 1-hour window"
+    },
+    {
+      "name": "avg_temperature",
+      "type": "float",
+      "doc": "Average temperature over the hour"
+    },
+    {
+      "name": "max_temperature",
+      "type": "float",
+      "doc": "Maximum temperature over the hour"
+    },
+    {
+      "name": "min_temperature",
+      "type": "float",
+      "doc": "Minimum temperature over the hour"
+    },
+    {
+      "name": "event_count",
+      "type": "int",
+      "doc": "Number of raw events aggregated in this window"
+    }
+  ]
+}

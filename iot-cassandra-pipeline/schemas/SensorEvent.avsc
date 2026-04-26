@@ -1,0 +1,40 @@
+{
+  "type": "record",
+  "name": "SensorEvent",
+  "namespace": "com.iot.pipeline",
+  "doc": "Raw sensor reading emitted by an IoT device. Namespace 'com.iot.pipeline' scopes this record to avoid name collisions with other schemas in the registry.",
+  "fields": [
+    {
+      "name": "device_id",
+      "type": "string",
+      "doc": "UUID of the device as a string"
+    },
+    {
+      "name": "device_name",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Human-readable sensor label, e.g. Sensor-042"
+    },
+    {
+      "name": "timestamp",
+      "type": "long",
+      "doc": "Event time as Unix epoch milliseconds"
+    },
+    {
+      "name": "temperature",
+      "type": "float",
+      "doc": "Temperature reading in Celsius"
+    },
+    {
+      "name": "humidity",
+      "type": "float",
+      "doc": "Relative humidity percentage"
+    },
+    {
+      "name": "location",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "City or zone where the device is installed"
+    }
+  ]
+}
