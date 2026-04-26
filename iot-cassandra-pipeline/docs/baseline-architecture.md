@@ -62,10 +62,10 @@ The baseline environment is containerized with Docker Compose and includes:
 - Three Cassandra nodes in a single datacenter cluster.
 - One Cassandra initialization container that applies the schema.
 - One Schema Registry container.
-- An optional fourth Cassandra node enabled through the `scaleout` profile.
+- An optional fourth Cassandra node enabled through the `scaleout` profile to show the automatic scale-out capabilities (auto-sharding and load balancing) of Cassandra.
 
-Spark is not containerized in this baseline. It runs externally with
-`spark-submit` and connects to Kafka and Cassandra through their exposed ports.
+Spark consumer and producer are not containerized in this baseline. Consumer run externally with
+`spark-submit` and connect to Kafka and Cassandra through their exposed ports.
 
 ### Kafka Topics
 
@@ -92,15 +92,15 @@ experiments, but it is not part of the default baseline.
 
 The Compose file applies explicit memory limits to the main JVM-based services:
 
-| Component | Memory limit | Notes |
-|---|---:|---|
-| Zookeeper | 512 MB | Lightweight coordination service |
-| Kafka | 1 GB | Broker heap explicitly tuned |
-| Cassandra node 1 | 1800 MB | Seed node, slightly larger budget |
-| Cassandra node 2 | 1500 MB | Standard data node |
-| Cassandra node 3 | 1500 MB | Standard data node |
-| Schema Registry | 512 MB | Metadata service |
-| Cassandra node 4 (optional) | 1500 MB | Enabled only with `scaleout` profile |
+| Component                   | Memory limit | Notes                                |
+| --------------------------- | -----------: | ------------------------------------ |
+| Zookeeper                   |       512 MB | Lightweight coordination service     |
+| Kafka                       |         1 GB | Broker heap explicitly tuned         |
+| Cassandra node 1            |      1800 MB | Seed node, slightly larger budget    |
+| Cassandra node 2            |      1500 MB | Standard data node                   |
+| Cassandra node 3            |      1500 MB | Standard data node                   |
+| Schema Registry             |       512 MB | Metadata service                     |
+| Cassandra node 4 (optional) |      1500 MB | Enabled only with `scaleout` profile |
 
 This keeps the baseline predictable on a development machine and avoids the
 unbounded JVM memory behavior that commonly appears when Cassandra and Kafka are
@@ -144,7 +144,7 @@ The producer is not fully random. It embeds a controlled anomaly model:
 - All abnormal sensors are clustered in `room_A`.
 - There are 3 abnormal sensors per sensor type.
 
-This design supports the main demo story of the project: threshold alerts first
+This design supports the main demo story of the project about **Cassandra 5 _Vector Search_**: threshold alerts first
 cluster in one room, then analytical and similarity-oriented logic can identify
 related abnormal behavior among peer sensors.
 
@@ -160,11 +160,11 @@ Each message contains a common base:
 
 Then each topic-specific payload adds the relevant measurements:
 
-| Sensor type | Fields |
-|---|---|
+| Sensor type     | Fields                    |
+| --------------- | ------------------------- |
 | `temp_humidity` | `temperature`, `humidity` |
-| `light` | `light_level` |
-| `power` | `voltage`, `amperage` |
+| `light`         | `light_level`             |
+| `power`         | `voltage`, `amperage`     |
 
 For power sensors, `wattage` is **not** sent by the producer. It is derived
 later in Spark as `voltage * amperage`.
@@ -242,7 +242,7 @@ The analytical aggregations use event-time processing with a **1 minute**
 watermark and **30 second tumbling windows**. This keeps the baseline close to
 real-time while still allowing small delays in event arrival.
 
-### Profile Refresh Path
+<!-- ### Profile Refresh Path
 
 Behavior profiles are not built with `applyInPandasWithState`. Instead, the
 project uses a `foreachBatch` approach driven by a lightweight `rate` stream
@@ -250,7 +250,7 @@ that triggers recomputation every 30 seconds.
 
 This is a deliberate architectural choice. It avoids Arrow-dependent stateful
 execution complexity while still producing rolling per-sensor profiles that are
-suitable for vector search experiments in Cassandra.
+suitable for vector search experiments in Cassandra. -->
 
 ---
 
@@ -260,11 +260,11 @@ suitable for vector search experiments in Cassandra.
 
 The schema is split into three keyspaces, each with a different role:
 
-| Keyspace | Purpose |
-|---|---|
-| `iot_raw` | Raw ingestion and operational lookup tables |
-| `iot_alerts` | Threshold-based alert storage |
-| `iot_analytics` | Aggregates and behavior profiles |
+| Keyspace        | Purpose                                     |
+| --------------- | ------------------------------------------- |
+| `iot_raw`       | Raw ingestion and operational lookup tables |
+| `iot_alerts`    | Threshold-based alert storage               |
+| `iot_analytics` | Aggregates and behavior profiles            |
 
 All three use:
 
@@ -318,13 +318,12 @@ raw tables.
 This table reorganizes the same events by physical location instead of sensor.
 Its primary key is `((location_id, date), timestamp, sensor_id)`.
 
-This is an intentionally sparse table: only the columns relevant to the sensor
-type are populated in each row. That is useful in Cassandra because absent
+This is an **intentionally sparse** table for project presentation: only the columns relevant to the sensor type are populated in each row. That is useful in Cassandra because absent
 cells do not consume fixed-width row space the way a traditional relational
 layout would.
 
-A Storage-Attached Index is also created on `humidity` for this table, enabling
-secondary access patterns on raw humidity values.
+A ***Storage-Attached Index*** (**SAI**) is also created on `humidity` for this table, enabling
+secondary access patterns on raw humidity values for presentation purposes.
 
 ### Raw-table compaction
 
@@ -354,8 +353,8 @@ bounded daily partition design used by the raw sensor tables.
 This table supports cross-sensor analysis by sensor family. Its primary key is
 `((sensor_type, date), window_start, sensor_id)`.
 
-That layout makes it efficient to answer questions like “how are all power
-sensors performing today?” without scanning sensor-specific partitions one by
+That layout makes it efficient to answer questions like *“how are all power
+sensors performing today?”* without scanning sensor-specific partitions one by
 one.
 
 ### `sensor_behavior_profiles`
@@ -395,11 +394,11 @@ The profile vector is built as:
 
 The source metric depends on the sensor family:
 
-| Sensor type | Profile source metric |
-|---|---|
-| `temp_humidity` | `humidity` |
-| `light` | `light_level` |
-| `power` | `wattage` |
+| Sensor type     | Profile source metric |
+| --------------- | --------------------- |
+| `temp_humidity` | `humidity`            |
+| `light`         | `light_level`         |
+| `power`         | `wattage`             |
 
 Only sensors with at least 10 recent readings are materialized into the profile
 table, and the computation uses up to the most recent 200 values per sensor.
@@ -418,16 +417,16 @@ more important than maximizing raw write throughput.
 
 The baseline alert path checks readings against explicit thresholds:
 
-| Condition | Threshold |
-|---|---:|
-| Temperature high | 40.0 |
-| Temperature low | 5.0 |
-| Humidity high | 85.0 |
-| Humidity low | 20.0 |
-| Light high | 900.0 |
-| Voltage high | 240.0 |
-| Amperage high | 10.0 |
-| Wattage high | 2000.0 |
+| Condition        | Threshold |
+| ---------------- | --------: |
+| Temperature high |      40.0 |
+| Temperature low  |       5.0 |
+| Humidity high    |      85.0 |
+| Humidity low     |      20.0 |
+| Light high       |     900.0 |
+| Voltage high     |     240.0 |
+| Amperage high    |      10.0 |
+| Wattage high     |    2000.0 |
 
 In the current code, alerts are emitted for:
 
@@ -469,18 +468,18 @@ raw ingestion and analytics workloads.
 
 ## Engineering Decisions
 
-| Decision | Current baseline choice | Rationale |
-|---|---|---|
-| Sensor ingestion split | 3 Kafka topics by sensor family | Simpler schemas, clearer stream ownership, topic-level parallelism |
-| Physical sensor layout | 3 rooms × 3 types × 10 sensors | Reproducible demo topology |
-| Identity model | Stable UUIDv5 sensor IDs | Consistent partitions and repeatable experiments |
-| Anomaly design | 9 abnormal sensors clustered in `room_A` | Makes alert and similarity demos interpretable |
-| Raw storage model | Per-sensor tables + per-location table | Supports both sensor-centric and room-centric queries |
-| Replication strategy | `NetworkTopologyStrategy`, RF=2 | Topology-aware baseline for 3-node Cassandra |
-| Raw compaction | STCS | Better fit for append-heavy ingestion |
-| Analytics compaction | LCS | Better fit for read-heavy aggregate queries |
-| Profile computation | `foreachBatch` + periodic trigger | Avoids more complex stateful pandas/Arrow path |
-| Vector search support | `VECTOR<FLOAT, 3>` + SAI index | Prepares the project for ANN-style similarity search |
+| Decision               | Current baseline choice                  | Rationale                                                          |
+| ---------------------- | ---------------------------------------- | ------------------------------------------------------------------ |
+| Sensor ingestion split | 3 Kafka topics by sensor family          | Simpler schemas, clearer stream ownership, topic-level parallelism |
+| Physical sensor layout | 3 rooms × 3 types × 10 sensors           | Reproducible demo topology                                         |
+| Identity model         | Stable UUIDv5 sensor IDs                 | Consistent partitions and repeatable experiments                   |
+| Anomaly design         | 9 abnormal sensors clustered in `room_A` | Makes alert and similarity demos interpretable                     |
+| Raw storage model      | Per-sensor tables + per-location table   | Supports both sensor-centric and room-centric queries              |
+| Replication strategy   | `NetworkTopologyStrategy`, RF=2          | Topology-aware baseline for 3-node Cassandra                       |
+| Raw compaction         | STCS                                     | Better fit for append-heavy ingestion                              |
+| Analytics compaction   | LCS                                      | Better fit for read-heavy aggregate queries                        |
+| Profile computation    | `foreachBatch` + periodic trigger        | Avoids more complex stateful pandas/Arrow path                     |
+| Vector search support  | `VECTOR<FLOAT, 3>` + SAI index           | Prepares the project for ANN-style similarity search               |
 
 ---
 
@@ -496,10 +495,6 @@ The baseline is designed around the following access patterns:
 - Recent alerts for a sensor.
 - Recent alerts for a room.
 - Similarity search among peer sensors in the same room and sensor type.
-
-This is the main architectural improvement over the previous baseline: the
-schema is now explicitly shaped around multiple read paths instead of a single
-generic event table.
 
 ---
 
@@ -548,9 +543,6 @@ This baseline already includes more than simple ingestion. It provides:
 - behavior profiling for vector search
 - schema bootstrap through Docker Compose
 
-In other words, the current “baseline” is the first fully coherent version of
-the end-to-end architecture, not just a minimal proof of concept.
-
 ---
 
 ## Notes
@@ -559,8 +551,7 @@ A few details are worth calling out explicitly:
 
 - `wattage` is computed in Spark, not produced directly by the sensors.
 - The behavior profile for `temp_humidity` sensors is based on humidity, not temperature.
-- The default cluster is 3 Cassandra nodes, but a fourth node is already prepared for future scale-out testing.
-- Schema Registry is present in the environment even though the current producer still publishes JSON.
+- The default cluster is 3 Cassandra nodes, but a fourth node is already prepared for scale-out testing.
 - The current Spark application runs many concurrent streaming queries because each storage path is intentionally materialized separately.
 
 These choices make the repository a stronger systems project: it now shows
