@@ -1,0 +1,3 @@
+iot-cassandra-pipeline/presentation/*
+iot-cassandra-pipeline/schemas/*
+iot-cassandra-pipeline/monitoring/*
