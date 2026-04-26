@@ -443,9 +443,26 @@ This delay is intentional: it prevents "zombie data" from resurrecting on nodes 
 - **No locking**: because nothing is modified in place, **concurrent writes never block each other**.
 - **Write cost is constant $O(1)$**: the write path is always the same two operations (CommitLog + MemTable), regardless of how much data already exists in the table — this is why Cassandra sustains 10k–50k writes/sec per node consistently.
 
+### 4.6 Why Writes Are Fast: O(1)
+
+**Traditional B-Tree (RDBMS)**:
+```
+1. Find page on disk → random seek (10ms)
+2. Lock page → modify → write back
+3. Update indexes → more seeks
+= 50-100 writes/sec/disk
+```
+
+**Cassandra LSM**:
+```
+1. Append to commit log → sequential (0.1ms)
+2. Insert to memtable → in-memory (0.01ms)
+= 10,000+ writes/sec/node
+```
+
 ---
 
-### 4.6 The core Read Path
+### 4.7 The core Read Path
 
 A read on a single node proceeds as follows:
 
@@ -453,7 +470,7 @@ A read on a single node proceeds as follows:
 - **Read from SSTable(s)** — the persisted data on disk.
 - **Merge** — resolve multiple versions of the same cell using ***last-write-wins*** (highest timestamp), suppress deleted cells via tombstones, return the final result.
 
-### 4.7 Read Optimization
+### 4.8 Read Optimization
 
 A read on a single node proceeds as follows:
 

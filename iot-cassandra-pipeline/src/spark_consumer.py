@@ -443,7 +443,13 @@ q11 = cassandra_sink(
 # Detect threshold breaches in incoming readings and generate alerts with severity levels
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# iot_alerts — sensor_alerts + alerts_by_location
+# Detect threshold breaches in incoming readings and generate alerts with severity levels
+# ──────────────────────────────────────────────────────────────────────────────
+
 UUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
 
 def detect_alerts(df: DataFrame) -> DataFrame:
     return (
@@ -504,9 +510,11 @@ def detect_alerts(df: DataFrame) -> DataFrame:
         )
         .select(
             col("sensor_id"),
+            col("sensor_type"),
+            col("location_id"),
+            col("date"),
             col("timestamp"),
             col("alert_id"),
-            col("location_id"),
             col("alert_type"),
             col("alert_message"),
             col("severity"),
@@ -517,7 +525,9 @@ def detect_alerts(df: DataFrame) -> DataFrame:
 def gen_uuid_str():
     return str(uuid_lib.uuid4())
 
+
 gen_uuid = udf(gen_uuid_str, StringType())
+
 
 def write_alerts_batch(batchdf, batchid):
     if batchdf.isEmpty():
@@ -527,8 +537,35 @@ def write_alerts_batch(batchdf, batchid):
     if alerts.isEmpty():
         return
 
-    alerts.write.format("org.apache.spark.sql.cassandra") \
+    sensor_alerts_df = alerts.select(
+        "sensor_id",
+        "timestamp",
+        "alert_id",
+        "location_id",
+        "alert_type",
+        "alert_message",
+        "severity",
+    )
+
+    alerts_by_location_df = alerts.select(
+        "location_id",
+        "date",
+        "timestamp",
+        "sensor_id",
+        "alert_id",
+        "sensor_type",
+        "alert_type",
+        "severity",
+        "alert_message",
+    )
+
+    sensor_alerts_df.write.format("org.apache.spark.sql.cassandra") \
         .options(table="sensor_alerts", keyspace=KS_ALERTS) \
+        .mode("append") \
+        .save()
+
+    alerts_by_location_df.write.format("org.apache.spark.sql.cassandra") \
+        .options(table="alerts_by_location", keyspace=KS_ALERTS) \
         .mode("append") \
         .save()
 
@@ -541,6 +578,7 @@ th_for_alerts = (
         "sensor_id",
         "sensor_type",
         "location_id",
+        "date",
         "timestamp",
         "temperature",
         "humidity",
@@ -549,6 +587,7 @@ th_for_alerts = (
         "amperage",
     )
 )
+
 
 light_for_alerts = (
     raw_light.withColumn("temperature", lit(None).cast(FloatType()))
@@ -559,6 +598,7 @@ light_for_alerts = (
         "sensor_id",
         "sensor_type",
         "location_id",
+        "date",
         "timestamp",
         "temperature",
         "humidity",
@@ -568,6 +608,7 @@ light_for_alerts = (
     )
 )
 
+
 power_for_alerts = (
     raw_power_enriched.withColumn("temperature", lit(None).cast(FloatType()))
     .withColumn("humidity", lit(None).cast(FloatType()))
@@ -576,6 +617,7 @@ power_for_alerts = (
         "sensor_id",
         "sensor_type",
         "location_id",
+        "date",
         "timestamp",
         "temperature",
         "humidity",
@@ -584,6 +626,7 @@ power_for_alerts = (
         "amperage",
     )
 )
+
 
 q12 = (
     th_for_alerts.unionByName(light_for_alerts)

@@ -211,8 +211,32 @@ AND compaction = {
 }
 AND comment = 'Threshold alerts from Spark. alert_id prevents millisecond-collision overwrites. LCS for read-optimized alert queries.';
 
--- SIA index, create it in live:
+-- ------------------------------------------------------------
+-- TABLE: alerts_by_location
+-- Purpose: Alerts grouped by location and day.
+-- Query:   "recent alerts for location X on date D"
+-- Key design: location_id and date form the partition key so
+--             alerts for a place are stored together by day.
+--             timestamp DESC gives recency ordering. sensor_id
+--             and alert_id as clustering columns keep rows
+--             unique and preserve deterministic ordering.
+-- Compaction: Leveled — alerts are read frequently, written sparsely.
+-- ------------------------------------------------------------
 
+CREATE TABLE IF NOT EXISTS iot_alerts.alerts_by_location (
+    location_id text,
+    date date,
+    timestamp timestamp,
+    sensor_id uuid,
+    alert_id uuid,
+    sensor_type text,
+    alert_type text,
+    severity text,
+    alert_message text,
+    PRIMARY KEY ((location_id, date), timestamp, sensor_id, alert_id)
+) WITH CLUSTERING ORDER BY (timestamp DESC, sensor_id ASC, alert_id ASC);
+
+-- SIA index, create it in live:
 -- CREATE CUSTOM INDEX IF NOT EXISTS sensor_alerts_location_sai ON iot_alerts.sensor_alerts (location_id) USING 'StorageAttachedIndex';
 
 -- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
