@@ -329,4 +329,4 @@ A few important details about the current version:
 
 ## License
 
-MIT License.
+MIT License. 
